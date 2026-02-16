@@ -29,7 +29,7 @@ var_hostname=smarthome.xxx.xx
 var_template_storage=local
 var_container_storage=Raid6-1
 ```
-
+```
 /mnt/smarthome mit 16GB zusätzlich einhängen.
 /mnt/smarthome/homeassistant/config/backups mit 30Gb zusätzlich einhängen.
 
@@ -87,3 +87,4 @@ apt install -y evcc
 
 
 apt -y install mosquitto mosquitto-clients
+```
