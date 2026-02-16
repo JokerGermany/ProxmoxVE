@@ -1,6 +1,7 @@
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/debian.sh)"
 
 cat /usr/local/community-scripts/defaults/debian.vars
+```
 # App-specific defaults for Debian (debian)
 # Generated on 2026-02-15T16:51:42Z
 
@@ -27,6 +28,7 @@ var_verbose=yes
 var_hostname=smarthome.xxx.xx
 var_template_storage=local
 var_container_storage=Raid6-1
+```
 
 /mnt/smarthome mit 16GB zusätzlich einhängen.
 /mnt/smarthome/homeassistant/config/backups mit 30Gb zusätzlich einhängen.
