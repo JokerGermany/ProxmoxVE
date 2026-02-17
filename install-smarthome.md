@@ -56,7 +56,8 @@ if [[ ${prompt,,} =~ ^(y|yes)$ ]]; then
 fi
 
 mkdir -p /mnt/smarthome/mosquitto/config
-ln -s /mnt/smarthome/mosquitto/config /var/log/mosquitto/
+
+ln -s /mnt/smarthome/mosquitto/config /etc/mosquitto
 
 mkdir -p /mnt/smarthome/evcc/evcc-user
 ln -s /mnt/smarthome/evcc/evcc-user /var/lib/evcc
