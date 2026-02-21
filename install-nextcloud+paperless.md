@@ -4,12 +4,10 @@ https://community-scripts.github.io/ProxmoxVE/scripts?id=nextcloudpi
 Dann die DB und Dateien einhängen
 
 /mnt/cloud-config - 5GB
+```
 mkdir -p /mnt/cloud-config/mysql /mnt/cloud-config/nextcloud
 ln -s /mnt/cloud-config/mysql /var/lib/mysql
 ln -s /mnt/cloud-config/nextcloud /var/www/nextcloud
-
-```
-rmdir /var/lib/mysql/lost+found
 ```
 Anschließend die NextcloudPi Installation starten.
 Anschließend init machen
