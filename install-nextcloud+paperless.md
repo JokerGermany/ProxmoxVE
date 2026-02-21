@@ -7,11 +7,12 @@ https://community-scripts.github.io/ProxmoxVE/scripts?id=nextcloudpi
 Dann die DB und Dateien einhängen
 
 /var/lib/mysql - 5GB
-
+```
+rmdir /var/lib/mysql/lost+found
+```
 Anschließend die NextcloudPi Installation starten.
 
-ffne die MariaDB-Konfiguration für Overrides:
-Bash
+Öffne die MariaDB-Konfiguration für Overrides:
 ```
 systemctl edit mariadb.service
 ```
