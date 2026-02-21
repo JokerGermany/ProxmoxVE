@@ -1,39 +1,28 @@
-Auf Proxmox:
-```
-chown -R 100033:100033 /mnt/wichtig/cloud
-```
+
 Container Installation anfangen und aufhören wenn gefragt wird ob NextCloudPi installiert wird
 https://community-scripts.github.io/ProxmoxVE/scripts?id=nextcloudpi
 Dann die DB und Dateien einhängen
 
-/var/lib/mysql - 5GB
+/mnt/cloud-config - 5GB
+mkdir -p /mnt/cloud-config/mysql /mnt/cloud-config/nextcloud
+ln -s /mnt/cloud-config/mysql /var/lib/mysql
+ln -s /mnt/cloud-config/nextcloud /var/www/nextcloud
+
 ```
 rmdir /var/lib/mysql/lost+found
 ```
 Anschließend die NextcloudPi Installation starten.
+Anschließend init machen
+danach die Migration starten:
+https://github.com/JokerGermany/ProxmoxVE/blob/main/migrate-nc_postgres_docker%20-%3E%20nextcloudpi.md
 
-Öffne die MariaDB-Konfiguration für Overrides:
+Auf Proxmox:
 ```
-systemctl edit mariadb.service
-```
-Füge exakt diesen Block ein:
-```
-[Service]
-# Entfernt bestehende Einschränkungen
-ProtectSystem=false
-ReadWritePaths=/var/lib/mysql
-# Erzwingt die Rechte vor jedem Start
-ExecStartPre=/usr/bin/chown -R mysql:mysql /var/lib/mysql
-ExecStartPre=/usr/bin/chmod -R 755 /var/lib/mysql
+chown -R 100033:100033 /mnt/wichtig/cloud
 ```
 
-Speichern und MariaDB neu starten:
 ```
-systemctl daemon-reload
-systemctl restart mariadb
+pct set 113 -mp1 /mnt/wichtig/cloud,mp=/opt/ncdata/data
 ```
 
-irgendwann:
-```
-pct set 113 -mp0 /mnt/wichtig/cloud,mp=/opt/ncdata/data
-```
+TODO: paperless share outsourcen
