@@ -131,3 +131,33 @@ ln -s /mnt/cloud-config/skripts/paperless-scanner.service /etc/systemd/system/pa
 
 systemctl daemon-reload
 systemctl enable --now paperless-scanner.service
+
+# Freigabe für Scanner
+Alle Aktionen werden im Nextcloud PI Container ausgeführt.
+```
+apt install samba -y
+adduser --system --no-create-home --group smb
+smbpasswd -a smb
+vi /etc/samba/smb.conf
+```
+Vor 
+```# NextCloudPi automatically generated from here. Do not remove this comment```
+Folgendes hinzufügen
+```
+[Max-Paperless]
+path = /opt/ncdata/data/MaxMustermann/files/Sync/Dokumente/paperless/consume/
+browsable = yes
+read only = no
+guest ok = no
+valid users = smb
+# Wichtig: Neue Dateien sollen dem Web-User gehören
+force user = www-data
+force group = www-data
+create mask = 0664
+directory mask = 0775
+
+...
+```
+```
+systemctl restart smbd
+```
