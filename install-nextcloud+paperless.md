@@ -52,6 +52,7 @@ systemctl start --all paperless-*
 # inotify
 Wenn Paperless etwas schreibt, merkt das Nextcloud nicht.
 Daher müssen wir Nextcloud aufmerksam machen.
+Alle Aktionen werden im Nextcloud PI Container ausgeführt.
 
 ```
 apt install inotify-tools -y
