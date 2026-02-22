@@ -5,7 +5,7 @@ Dann die DB und Dateien einhängen
 
 /mnt/cloud-config - 5GB
 ```
-mkdir -p /mnt/cloud-config/mysql /mnt/cloud-config/nextcloud
+mkdir -p /mnt/cloud-config/mysql /mnt/cloud-config/nextcloud /mnt/cloud-config/skripts
 ln -s /mnt/cloud-config/mysql /var/lib/mysql
 ln -s /mnt/cloud-config/nextcloud /var/www/nextcloud
 ```
@@ -47,59 +47,86 @@ pct set 114 -mp4 /mnt/wichtig/cloud/MaxMustermann/files/Sync/Dokumente/paperless
 
 systemctl start postgresql
 systemctl start --all paperless-*
-vi /mnt/paperless/scripts/notify-nextcloud.sh
 ```
 
+# inotify
+Wenn Paperless etwas schreibt, merkt das Nextcloud nicht.
+Daher müssen wir Nextcloud aufmerksam machen.
 
-Wenn Paperless User != Nextcloud User
+```
+apt install inotify-tools -y
+```
+vi /mnt/cloud-config/skripts/paperless-scanner.sh
 ```
 #!/bin/bash
-# Extrahiere den Namen des Unterordners aus dem Dateinamen oder Pfad
-# Wenn Paperless die Datei in /.../archive/Max0Mustermann/ abgelegt hat:
-if [[ "$DOCUMENT_FILE_NAME" == *"Max0Mustermann"* ]]; then #PaperlessUser
-    NC_USER="MaxMustermann" 
-    NC_SUBPATH="/MaxMustermann/files/Sync/Dokumente/paperless"
-elif [[ "$DOCUMENT_FILE_NAME" == *"xyz"* ]]; then
-    NC_USER="Xyz
-    NC_SUBPATH="/xyz/files/Dokumente/paperless"
 
-fi
+# Definition der zu überwachenden Verzeichnisse (Physikalische Pfade im LXC)
+# Wir überwachen jeweils den Haupt-Ordner "paperless" pro User
+declare -A WATCH_MAP
+WATCH_MAP["/opt/ncdata/data/MaxMustermann/files/Sync/Dokumente/paperless"]="MaxMustermann/files/Sync/Dokumente/paperless"
+...
 
-# Nur den Scan auslösen, wenn ein Match gefunden wurde
-if [ ! -z "$NC_USER" ]; then
-    ssh root@nextcloud-ip "sudo -u www-data php /var/www/nextcloud/occ files:scan --path='$NC_SUBPATH'"
-fi
-```
-Wenn Paperless User = Nextcloud User:
-```
-#!/bin/bash
-# Wir extrahieren den Usernamen aus dem Pfad.
-# Wenn der Pfad z.B. "archive/MaxMustermann/datei.pdf" ist:
-NC_USER=$(echo "$DOCUMENT_FILE_NAME" | cut -d'/' -f2)
-NC_PATH="/$NC_USER/files/Dokumente/paperless"
-# Den Befehl per SSH an den Nextcloud-LXC senden
-# Wir scannen nur den spezifischen Pfad des Users für maximale Geschwindigkeit
-ssh root@nextcloud-ip \
-"sudo -u www-data php /var/www/nextcloud/occ files:scan --path='$NC_PATH'"
+LOCK_DIR="/dev/shm/nc_locks"
+mkdir -p "$LOCK_DIR"
+
+echo "Nextcloud-Autoscanner gestartet. Überwache nur Paperless-Verzeichnisse..."
+
+# Wir starten inotifywait mit der Liste aller Keys (Pfade) aus der WATCH_MAP
+inotifywait -m -r -e moved_to -e close_write -e delete "${!WATCH_MAP[@]}" --format '%w%f' | while read FILE
+do
+    NC_SCAN_PATH=""
+    
+    # Prüfen, welcher Überwachungspfad im Pfad der geänderten Datei steckt
+    for WATCH_PATH in "${!WATCH_MAP[@]}"; do
+        if [[ "$FILE" == "$WATCH_PATH"* ]]; then
+            NC_SCAN_PATH="${WATCH_MAP[$WATCH_PATH]}"
+            # User extrahieren (Erster Teil des Nextcloud-Pfads)
+            NC_USER=$(echo "$NC_SCAN_PATH" | cut -d'/' -f1)
+            break
+        fi
+    done
+
+    if [ -n "$NC_SCAN_PATH" ]; then
+        USER_LOCK="$LOCK_DIR/$NC_USER.lock"
+
+        if [ -f "$USER_LOCK" ]; then
+            continue
+        fi
+
+        touch "$USER_LOCK"
+        
+        (
+            sleep 2
+            echo "$(date '+%H:%M:%S') - Änderung in $NC_USER erkannt. Scanne $NC_SCAN_PATH"
+            sudo -u www-data php8.3 /var/www/nextcloud/occ files:scan --path="$NC_SCAN_PATH" --quiet
+            rm "$USER_LOCK"
+        ) &
+    fi
+done
 ```
 
-Damit das Skript ohne Passwort funktioniert:
+```
+chmod +x /mnt/cloud-config/skripts/paperless-scanner.sh
+vi /mnt/cloud-config/skripts/paperless-scanner.service
+```
 
-Erzeuge im Paperless-LXC als der User, unter dem Paperless läuft, einen SSH-Key: 
-     
-```
-ssh-keygen
-```
-Kopiere den Public Key in den Nextcloud-LXC:
+
 
 ```
-ssh-copy-id root@extcloud-ip
+[Unit]
+Description=Nextcloud Inotify Autoscanner
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /mnt/cloud-config/skripts/paperless-scanner.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
 ```
-Test-Login: Einmal manuell vom Paperless-LXC zum Nextcloud-LXC verbinden, um den Fingerprint zu bestätigen.
-```
-vi /mnt/paperless/opt/paperless/paperless.conf
-```
-hinzufügen:
-```
-PAPERLESS_POST_CONSUME_SCRIPT="/mnt/paperless/scripts/notify-nextcloud.sh"
-```
+ln -s /mnt/cloud-config/skripts/paperless-scanner.service /etc/systemd/system/paperless-scanner.service
+
+systemctl daemon-reload
+systemctl enable --now paperless-scanner.service
