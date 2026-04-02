@@ -115,9 +115,9 @@ apt -y install mosquitto mosquitto-clients
       LATEST_IMAGE="$(podman inspect --format "{{.Id}}" --type image "${CONTAINER_IMAGE}")"
       if [[ "${RUNNING_IMAGE}" != "${LATEST_IMAGE}" ]]; then
         echo "Updating ${container} image ${CONTAINER_IMAGE}"
-        systemctl restart homeassistant
       fi
     done
+    systemctl restart homeassistant
     echo "All containers updated."
   exit
   ```
