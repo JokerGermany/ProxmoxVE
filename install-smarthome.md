@@ -89,3 +89,35 @@ apt install -y evcc
 
 apt -y install mosquitto mosquitto-clients
 ```
+
+/usr/bin/update
+```
+#!/usr/bin/env bash
+#bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/evcc.sh)"
+  if [[ -f /etc/apt/sources.list.d/evcc-stable.list ]]; then
+    setup_deb822_repo \
+      "evcc-stable" \
+      "https://dl.evcc.io/public/evcc/stable/gpg.EAD5D0E07B0EC0FD.key" \
+      "https://dl.evcc.io/public/evcc/stable/deb/debian/" \
+      "$(get_os_info codename)" \
+      "main"
+  fi
+  echo "Updating smarthome LXC"
+  apt update
+  apt -y upgrade
+  echo "Updated successfully!"
+  echo "Updating All Containers\n"
+    CONTAINER_LIST="${1:-$(podman ps -q)}"
+    for container in ${CONTAINER_LIST}; do
+      CONTAINER_IMAGE="$(podman inspect --format "{{.Config.Image}}" --type container ${container})"
+      RUNNING_IMAGE="$(podman inspect --format "{{.Image}}" --type container "${container}")"
+      podman pull "${CONTAINER_IMAGE}"
+      LATEST_IMAGE="$(podman inspect --format "{{.Id}}" --type image "${CONTAINER_IMAGE}")"
+      if [[ "${RUNNING_IMAGE}" != "${LATEST_IMAGE}" ]]; then
+        echo "Updating ${container} image ${CONTAINER_IMAGE}"
+        systemctl restart homeassistant
+      fi
+    done
+    echo "All containers updated."
+  exit
+  ```
