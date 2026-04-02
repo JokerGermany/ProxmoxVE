@@ -94,6 +94,7 @@ apt -y install mosquitto mosquitto-clients
 ```
 #!/usr/bin/env bash
 #bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/evcc.sh)"
+ podman image prune -a -f
   if [[ -f /etc/apt/sources.list.d/evcc-stable.list ]]; then
     setup_deb822_repo \
       "evcc-stable" \
@@ -118,6 +119,7 @@ apt -y install mosquitto mosquitto-clients
       fi
     done
     systemctl restart homeassistant
+    podman image prune -a -f
     echo "All containers updated."
   exit
   ```
