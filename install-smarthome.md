@@ -8,7 +8,7 @@ cat /usr/local/community-scripts/defaults/debian.vars
 var_unprivileged=0
 var_cpu=2
 var_ram=3072
-var_disk=10
+var_disk=15
 var_brg=vmbr0
 var_net=192.168.2.11/24
 var_gateway=192.168.2.1
