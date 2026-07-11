@@ -462,11 +462,6 @@ done
 
 systemctl daemon-reload
 
-# Instanz "user1" komplett hochziehen
-systemctl enable --now fz-xvfb@user1.service
-systemctl enable --now fz-x11vnc@user1.service
-systemctl enable --now fz-novnc@user1.service
-systemctl enable --now fz-grid@user1.service
 nft add rule inet filter input ip saddr 192.168.1.11 tcp dport { 6901, 6902 } accept
 nft add rule inet filter input tcp dport { 6901, 6902 } drop
 ```
