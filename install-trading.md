@@ -11,6 +11,7 @@ npm install playwright
 npx playwright install --with-deps chromium```
 ```
 
+```
 /opt/fz-grid/
 ├── runner.js
 ├── userscript.js
@@ -24,7 +25,7 @@ npx playwright install --with-deps chromium```
     ├── fz-xvfb@.service
     ├── fz-x11vnc@.service
     └── fz-grid@.service
-
+```
 
 
 runner.js
