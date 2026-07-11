@@ -707,6 +707,25 @@ body { font-family: sans-serif; text-align: center; margin-top: 15%; background:
 </html>
 EOF
 ```
+# Delete old Logs at Boot
+```
+cat <<'EOF' | sudo tee /opt/fz-grid/systemd/clear-maintenance-logs.service >/dev/null
+[Unit]
+Description=Clear maintenance logs on boot
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c ': > /var/log/session-end.log; : > /var/log/update-and-shutdown.log'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+ln -sf "/opt/fz-grid/systemd/clear-maintenance-logs.service" "/etc/systemd/system/clear-maintenance-logs.service"
+sudo systemctl daemon-reload
+sudo systemctl enable clear-maintenance-logs.service
+```
 # Starten des Trading-LXCs über Webaufruf
 ```
 Browser → npmplus LXC (nginx) → auth_request /start-check → SSH (forced command) → Proxmox-Host
