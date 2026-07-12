@@ -2,7 +2,7 @@
 /opt 1GB
 
 ```
-apt-get install -y nodejs npm python3-pip xvfb x11vnc
+apt-get install -y nodejs npm xvfb x11vnc
 mkdir -p /opt/fz-grid/systemd/ /opt/fz-grid/profiles/user1 /opt/fz-grid/env/
 
 cd /opt/fz-grid
