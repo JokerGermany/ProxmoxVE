@@ -32,8 +32,18 @@ npmplus (reverse-proxy) ──proxy_pass :8080──▶ Guac+Trading-LXC ──V
 runner.js
 ```
 // /opt/fz-grid/runner.js
-// Version: 1.4.0
+// Version: 1.5.0
 // Änderungen in dieser Version:
+// - Neu: Erkennung der Login-Seite (Origin ohne Subpath, z.B. "/" oder "").
+//   Bleibt der Browser 5 Minuten durchgehend auf dieser Login-Seite, ohne
+//   dass zu TARGET_URL (oder einem anderen Subpath) weitergeleitet wird,
+//   wird dies wie ein manuelles Schließen des Browsers behandelt
+//   (context.close() wird aufgerufen -> bestehender close-Handler greift,
+//   inkl. Snapshot + sauberem Exit + ExecStopPost-Kette).
+// - Timer wird bei Navigation weg von der Login-Seite zurückgesetzt.
+// - Zusätzliches Fallback-Polling für SPA-Navigation ohne "framenavigated".
+//
+// Änderungen aus 1.4.0 (weiterhin enthalten):
 // - Normales manuelles Schließen des Chromium-Fensters wird nicht mehr
 //   vorschnell als Fehler/Crash behandelt.
 // - context.on('close') beendet den Prozess nicht mehr hart sofort.
@@ -46,7 +56,7 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-const RUNNER_VERSION = '1.4.0';
+const RUNNER_VERSION = '1.5.0';
 
 const USER_DATA_DIR = process.env.USER_DATA_DIR;
 if (!USER_DATA_DIR) {
@@ -79,12 +89,18 @@ const SESSION_STORAGE_FILE = path.join(USER_DATA_DIR, 'fz-grid-session-storage.j
 const SNAPSHOT_INTERVAL_MS = 15000;
 const CONTEXT_CLOSE_GUARD_MS = 4000;
 
+// --- Login-Idle-Erkennung ---
+const LOGIN_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minuten
+const LOGIN_POLL_INTERVAL_MS = 15000;        // Fallback-Polling für SPA-Navigation
+
 let context = null;
 let page = null;
 let shuttingDown = false;
 let snapshotIntervalHandle = null;
 let startupCompleted = false;
 let contextClosedHandled = false;
+let loginIdleTimer = null;
+let loginPollHandle = null;
 
 function cleanupStaleLocks() {
   const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
@@ -187,6 +203,62 @@ async function forceWindowBounds(targetPage, width, height) {
   }
 }
 
+// --- Login-Idle-Helper ---
+
+function isLoginOnlyUrl(urlString) {
+  try {
+    const u = new URL(urlString);
+    return u.origin === TARGET_ORIGIN && (u.pathname === '/' || u.pathname === '');
+  } catch {
+    return false;
+  }
+}
+
+function clearLoginIdleTimer() {
+  if (loginIdleTimer) {
+    clearTimeout(loginIdleTimer);
+    loginIdleTimer = null;
+  }
+}
+
+function armLoginIdleTimer() {
+  if (loginIdleTimer) return; // läuft bereits, nicht neu starten
+  console.log(`[RUNNER] Login-Seite ohne Subpath erkannt – starte ${LOGIN_IDLE_TIMEOUT_MS / 60000}-Minuten-Timer.`);
+  loginIdleTimer = setTimeout(async () => {
+    console.log('[RUNNER] 5 Minuten auf Login-Seite ohne Weiterleitung – behandle als manuelles Schließen des Browsers.');
+    loginIdleTimer = null;
+    try {
+      if (context) {
+        await context.close(); // triggert bestehenden context.on('close')-Handler
+      }
+    } catch (err) {
+      console.warn('[RUNNER] Fehler beim Schließen wegen Login-Timeout:', err.message);
+    }
+  }, LOGIN_IDLE_TIMEOUT_MS);
+}
+
+function checkLoginState() {
+  if (!page || page.isClosed()) return;
+  if (isLoginOnlyUrl(page.url())) {
+    armLoginIdleTimer();
+  } else {
+    clearLoginIdleTimer();
+  }
+}
+
+function handleFrameNavigation(frame) {
+  if (!page || frame !== page.mainFrame()) return;
+  checkLoginState();
+}
+
+function stopLoginIdleWatch() {
+  clearLoginIdleTimer();
+  if (loginPollHandle) {
+    clearInterval(loginPollHandle);
+    loginPollHandle = null;
+  }
+}
+
 async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -194,6 +266,7 @@ async function gracefulShutdown(signal) {
   console.log(`[RUNNER] Signal ${signal} empfangen – sichere Session-Cookies/sessionStorage und schließe Browser sauber…`);
 
   if (snapshotIntervalHandle) clearInterval(snapshotIntervalHandle);
+  stopLoginIdleWatch();
 
   try {
     await snapshotAll();
@@ -231,6 +304,7 @@ async function main() {
   console.log(`[RUNNER] Starte Chromium mit Profil: ${USER_DATA_DIR}`);
   console.log(`[RUNNER] DISPLAY: ${process.env.DISPLAY || '(nicht gesetzt)'}`);
   console.log(`[RUNNER] Fenstergröße (Ziel): ${WINDOW_SIZE.width}x${WINDOW_SIZE.height}`);
+  console.log(`[RUNNER] Login-Idle-Timeout: ${LOGIN_IDLE_TIMEOUT_MS / 60000} Minuten (Origin ohne Subpath: ${TARGET_ORIGIN}/)`);
 
   context = await chromium.launchPersistentContext(USER_DATA_DIR, {
     headless: false,
@@ -276,6 +350,7 @@ async function main() {
     contextClosedHandled = true;
 
     if (snapshotIntervalHandle) clearInterval(snapshotIntervalHandle);
+    stopLoginIdleWatch();
 
     if (shuttingDown) {
       console.log('[RUNNER] Browser-Kontext wurde im Rahmen des Shutdowns geschlossen.');
@@ -296,7 +371,7 @@ async function main() {
       return;
     }
 
-    console.log('[RUNNER] Chromium wurde vermutlich manuell geschlossen – beende Runner sauber ohne Fehler.');
+    console.log('[RUNNER] Chromium wurde vermutlich manuell geschlossen (oder Login-Idle-Timeout ausgelöst) – beende Runner sauber ohne Fehler.');
     process.exit(0);
   });
 
@@ -306,6 +381,8 @@ async function main() {
     console.log(`[PAGE:${msg.type()}]`, msg.text());
   });
 
+  page.on('framenavigated', handleFrameNavigation);
+
   await forceWindowBounds(page, WINDOW_SIZE.width, WINDOW_SIZE.height);
 
   await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded' });
@@ -313,6 +390,14 @@ async function main() {
   console.log(`[RUNNER] Seite geladen: ${TARGET_URL}`);
   console.log('[RUNNER] Falls kein Login/Freischaltung vorhanden: jetzt über noVNC einmalig durchführen.');
   console.log('[RUNNER] Die Session bleibt danach im Profilordner dauerhaft erhalten.');
+
+  // Initialen Login-Status prüfen (falls goto direkt auf der Login-Seite landet,
+  // z.B. weil die Session abgelaufen ist)
+  checkLoginState();
+
+  // Fallback-Polling für SPA-Navigationen, bei denen "framenavigated" nicht
+  // zuverlässig feuert (z.B. reine History-API-Änderungen)
+  loginPollHandle = setInterval(checkLoginState, LOGIN_POLL_INTERVAL_MS);
 
   snapshotIntervalHandle = setInterval(() => {
     snapshotAll().catch(err => console.warn('[RUNNER] Periodischer Snapshot fehlgeschlagen:', err.message));
