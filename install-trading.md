@@ -518,19 +518,51 @@ ln -sf /opt/maintenance/update-and-shutdown.timer /etc/systemd/system/update-and
 systemctl daemon-reload
 systemctl enable --now update-and-shutdown.timer
 ```
-# close session when chrome is closed
+# FZ-Grid Shutdown-Flow
 
-```
-mkdir -p /opt/scripts
-cat <<'EOF' > /opt/scripts/session-end.sh
+Diese Dokumentation beschreibt den funktionierenden Shutdown-Ablauf für das FZ-Grid-Setup mit `fz-grid@.service`, `ExecStopPost`, einem separaten Shutdown-Check und dem eigentlichen Update-/Shutdown-Skript. `ExecStopPost=` wird von systemd auch in Stop-/Fehlerpfaden ausgeführt und sollte deshalb kurz bleiben.[cite:2]
+
+## Ziel
+
+Der Container soll nur dann Updates ausführen und herunterfahren, wenn keine `fz-grid@*.service`-Instanz mehr aktiv ist. Der eigentliche Shutdown darf **nicht** direkt in einem langen `ExecStopPost`-Hook passieren, weil `TimeoutStopSec` auch den Stop-Pfad begrenzt und ein zu langer `ExecStopPost` dadurch abgebrochen werden kann.[cite:2][cite:34]
+
+## Finaler Ablauf
+
+1. Chromium wird geschlossen und `runner.js` beendet sich regulär.
+2. `fz-grid@userX.service` läuft in `ExecStopPost=/opt/scripts/session-end.sh %i`.
+3. `session-end.sh` schreibt nur einen Logeintrag und startet den separaten Check-Service.
+4. `fz-grid-shutdown-check.service` ruft `/opt/maintenance/fz-grid-shutdown-check.sh` auf.
+5. Das Check-Skript zählt die laufenden `fz-grid@*.service`-Instanzen.
+6. Nur wenn `0` Instanzen laufen, wird `/opt/maintenance/update-and-shutdown.sh` gestartet.
+7. `update-and-shutdown.sh` führt `apt-get update`, `apt-get upgrade -y`, `apt-get autoremove -y`, `apt-get autoclean` und danach `shutdown -h now` aus.
+
+## Warum diese Trennung nötig ist
+
+`ExecStopPost=` ist für Cleanup geeignet, aber nicht für lange Warte- oder Maintenance-Logik. systemd führt `ExecStopPost=` auch dann aus, wenn ein Dienst fehlschlägt oder gestoppt wird, und der Stop-Pfad unterliegt weiterhin den konfigurierten Timeout-Grenzen.[cite:2][cite:1]
+
+Ein separater oneshot-Check-Service verhindert genau die Race-Condition, die vorher sichtbar war: Während `ExecStopPost` noch lief, war der `fz-grid`-Dienst aus systemd-Sicht noch nicht vollständig aus dem Stop-Pfad heraus. Dadurch konnte die Instanzzählung zu früh erfolgen oder der Stop-Post-Hook vom Timeout beendet werden.[cite:2][cite:34]
+
+## Verwendete Dateien
+
+| Pfad | Zweck |
+|---|---|
+| `/opt/scripts/session-end.sh` | Kurzer Trigger aus `ExecStopPost=`; schreibt Log und startet den Shutdown-Check. |
+| `/opt/maintenance/fz-grid-shutdown-check.sh` | Prüft, ob noch `fz-grid@*.service`-Instanzen laufen. |
+| `/etc/systemd/system/fz-grid-shutdown-check.service` | oneshot-Service für den Shutdown-Check. |
+| `/opt/maintenance/update-and-shutdown.sh` | Führt Update und Herunterfahren aus. |
+| `/etc/systemd/system/fz-grid@.service` | Hauptservice für jede Benutzerinstanz. |
+
+## Empfohlene Inhalte
+
+### `/opt/scripts/session-end.sh`
+
+```bash
 #!/bin/bash
 set -u
 
 INSTANCE="${1:-unknown}"
 LOCKFILE="/run/session-end.lock"
 LOGFILE="/var/log/session-end.log"
-SHUTDOWN_UNIT="fz-update-shutdown"
-SHUTDOWN_SCRIPT="/opt/maintenance/update-and-shutdown.sh"
 
 log() {
     echo "$(date '+%F %T') $*" >> "$LOGFILE"
@@ -542,44 +574,108 @@ if ! flock -n 9; then
     exit 0
 fi
 
-log "Sitzung beendet: ${INSTANCE}"
+log "Sitzung beendet: ${INSTANCE} | SERVICE_RESULT=${SERVICE_RESULT:-unknown} EXIT_CODE=${EXIT_CODE:-unknown} EXIT_STATUS=${EXIT_STATUS:-unknown}"
 
-for svc in fz-x11vnc fz-xvfb; do
-    systemctl stop "${svc}@${INSTANCE}.service" 2>/dev/null || true
-done
+systemctl start fz-grid-shutdown-check.service
+exit 0
+```
 
-sleep 5
+### `/opt/maintenance/fz-grid-shutdown-check.sh`
 
-RUNNING=$(
+```bash
+#!/bin/bash
+set -u
+
+LOGFILE="/var/log/update-and-shutdown.log"
+SHUTDOWN_SCRIPT="/opt/maintenance/update-and-shutdown.sh"
+
+log() {
+    echo "$(date '+%F %T') $*" | tee -a "$LOGFILE"
+}
+
+count_running_grids() {
     systemctl list-units --type=service --state=running --no-legend --plain \
     | awk '$1 ~ /^fz-grid@.*\.service$/ { c++ } END { print c+0 }'
-)
+}
 
-log "Noch laufende fz-grid Instanzen: ${RUNNING}"
+RUNNING="$(count_running_grids)"
+log "Shutdown-Check: laufende fz-grid Instanzen: ${RUNNING}"
 
 if [ "$RUNNING" -ne 0 ]; then
-    log "Kein Shutdown: es laufen noch ${RUNNING} fz-grid Instanz(en)"
+    log "Shutdown-Check: Abbruch, noch aktiv"
     exit 0
 fi
 
-if systemctl is-active --quiet "${SHUTDOWN_UNIT}.service"; then
-    log "Kein Shutdown: ${SHUTDOWN_UNIT}.service läuft bereits"
-    exit 0
-fi
-
-if systemctl list-jobs --no-legend 2>/dev/null | grep -q "${SHUTDOWN_UNIT}\.service"; then
-    log "Kein Shutdown: ${SHUTDOWN_UNIT}.service ist bereits als Job eingereiht"
-    exit 0
-fi
-
-log "Letzter Nutzer beendet, starte Update & Shutdown (no-block)"
-systemd-run --quiet --no-block --unit="${SHUTDOWN_UNIT}" "${SHUTDOWN_SCRIPT}"
-
-exit 0
-EOF
-
-chmod +x /opt/scripts/session-end.sh
+log "Shutdown-Check: kein Grid aktiv, starte Update & Shutdown"
+exec "$SHUTDOWN_SCRIPT"
 ```
+
+### `/etc/systemd/system/fz-grid-shutdown-check.service`
+
+```ini
+[Unit]
+Description=FZ-Grid Shutdown Check
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/maintenance/fz-grid-shutdown-check.sh
+TimeoutStartSec=300
+```
+
+### Relevanter Teil aus `fz-grid@.service`
+
+```ini
+[Service]
+EnvironmentFile=/opt/fz-grid/env/%i.env
+WorkingDirectory=/opt/fz-grid
+ExecStart=/usr/bin/node /opt/fz-grid/runner.js
+ExecStopPost=/opt/scripts/session-end.sh %i
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+KillSignal=SIGTERM
+```
+
+## Bekannte Fehlerbilder
+
+| Symptom | Ursache | Lösung |
+|---|---|---|
+| `State 'stop-post' timed out` | `ExecStopPost` war zu lang und wurde von systemd beendet.[cite:34][cite:2] | `session-end.sh` kurz halten; lange Logik in separaten oneshot-Service auslagern. |
+| `Failed at step EXEC ... Permission denied` | Check-Skript war nicht ausführbar. | `chmod +x /opt/maintenance/fz-grid-shutdown-check.sh` setzen. |
+| `Failed to parse time specification: noW` | Tippfehler im Shutdown-Befehl. | Exakt `/usr/sbin/shutdown -h now` verwenden.[cite:114] |
+| `Shutdown-Check: kein Marker vorhanden, beende` | Alte Marker-Logik war noch aktiv, obwohl direktes Starten des Check-Service genutzt wird. | Marker-Prüfung entfernen und Check direkt aus `session-end.sh` starten. |
+
+## Installation oder Aktualisierung
+
+```bash
+chmod +x /opt/scripts/session-end.sh
+chmod +x /opt/maintenance/fz-grid-shutdown-check.sh
+chmod +x /opt/maintenance/update-and-shutdown.sh
+
+cat >/etc/systemd/system/fz-grid-shutdown-check.service <<'EOF2'
+[Unit]
+Description=FZ-Grid Shutdown Check
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/maintenance/fz-grid-shutdown-check.sh
+TimeoutStartSec=300
+EOF2
+
+systemctl daemon-reload
+```
+
+## Testablauf
+
+1. `systemctl restart fz-grid@user1.service`
+2. Session im Browser regulär schließen.
+3. `tail -f /var/log/session-end.log`
+4. `journalctl -u fz-grid-shutdown-check.service -b --no-pager`
+5. `tail -f /var/log/update-and-shutdown.log`
+
+Wenn der Ablauf korrekt ist, erscheint zuerst der Logeintrag aus `session-end.sh`, danach der Shutdown-Check mit `laufende fz-grid Instanzen: 0`, dann der Update-Lauf und am Ende `=== Fahre System jetzt herunter ===` mit anschließendem Verbindungsabbruch durch den Shutdown.[cite:114]
 # Börse geschlossen Seite im npmplus
 ```
 mkdir -p /opt/npmplus/trading/html
