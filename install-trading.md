@@ -10,6 +10,7 @@ npm init -y
 npm install playwright
 npx playwright install --with-deps chromium```
 ```
+npmplus (reverse-proxy) ──proxy_pass :8080──▶ Guac+Trading-LXC ──VNC──▶ localhost:5901/5902 ──▶ Xvfb ──▶ Chromium
 
 ```
 /opt/fz-grid/
