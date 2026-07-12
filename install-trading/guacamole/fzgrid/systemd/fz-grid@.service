@@ -1,0 +1,17 @@
+[Unit]
+Description=FZ-Grid Playwright Runner für Instanz %i
+After=fz-xvfb@%i.service
+Requires=fz-xvfb@%i.service
+
+[Service]
+EnvironmentFile=/opt/fz-grid/env/%i.env
+WorkingDirectory=/opt/fz-grid
+ExecStart=/usr/bin/node /opt/fz-grid/runner.js
+ExecStopPost=/opt/scripts/session-end.sh %i
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

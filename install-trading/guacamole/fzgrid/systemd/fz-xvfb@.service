@@ -1,0 +1,11 @@
+[Unit]
+Description=Xvfb für Instanz %i
+
+[Service]
+EnvironmentFile=/opt/fz-grid/env/%i.env
+ExecStart=/usr/bin/Xvfb ${DISPLAY} -screen 0 1600x1000x24
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

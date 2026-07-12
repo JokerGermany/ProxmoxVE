@@ -1,0 +1,13 @@
+[Unit]
+Description=noVNC/websockify für Instanz %i
+After=fz-x11vnc@%i.service
+Requires=fz-x11vnc@%i.service
+
+[Service]
+EnvironmentFile=/opt/fz-grid/env/%i.env
+ExecStart=/usr/bin/websockify --web=/usr/share/novnc/ ${NOVNC_PORT} 127.0.0.1:${VNC_PORT}
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

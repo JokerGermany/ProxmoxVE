@@ -1,0 +1,9 @@
+[Unit]
+Description=System-Update und Shutdown
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/maintenance/update-and-shutdown.sh
+TimeoutStartSec=1800

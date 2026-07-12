@@ -1,0 +1,8 @@
+[Unit]
+Description=FZ-Grid Shutdown Check
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/maintenance/fz-grid-shutdown-check.sh
+TimeoutStartSec=300

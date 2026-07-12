@@ -1,0 +1,11 @@
+[Unit]
+Description=Clear maintenance logs on boot
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c ': > /var/log/session-end.log; : > /var/log/update-and-shutdown.log'
+
+[Install]
+WantedBy=multi-user.target

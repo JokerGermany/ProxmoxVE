@@ -1,0 +1,11 @@
+[Unit]
+Description=Zeitplan für Update-und-Shutdown (Mo-Fr 23:05, Sa 19:05)
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 23:05:00
+OnCalendar=Sat *-*-* 19:05:00
+Persistent=false
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
