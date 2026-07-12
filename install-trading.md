@@ -524,17 +524,26 @@ Diese Dokumentation beschreibt den funktionierenden Shutdown-Ablauf für das FZ-
 
 ## Ziel
 
-Der Container soll nur dann Updates ausführen und herunterfahren, wenn keine `fz-grid@*.service`-Instanz mehr aktiv ist. Der eigentliche Shutdown darf **nicht** direkt in einem langen `ExecStopPost`-Hook passieren, weil `TimeoutStopSec` auch den Stop-Pfad begrenzt und ein zu langer `ExecStopPost` dadurch abgebrochen werden kann.[cite:2][cite:34]
+Zwei Dinge sollen beim Beenden einer Session passieren:
+
+1. **Sofort:** Die zur beendeten Instanz gehörenden `fz-xvfb@USER`- und `fz-x11vnc@USER`-Services werden gestoppt — unabhängig davon, ob noch andere User aktiv sind.
+2. **Nur wenn danach keine `fz-grid@*.service`-Instanz mehr aktiv ist:** Der Container führt Updates aus und fährt herunter.
+
+Der eigentliche Shutdown darf **nicht** direkt in einem langen `ExecStopPost`-Hook passieren, weil `TimeoutStopSec` auch den Stop-Pfad begrenzt und ein zu langer `ExecStopPost` dadurch abgebrochen werden kann.[cite:2][cite:34]
 
 ## Finaler Ablauf
 
 1. Chromium wird geschlossen und `runner.js` beendet sich regulär.
 2. `fz-grid@userX.service` läuft in `ExecStopPost=/opt/scripts/session-end.sh %i`.
-3. `session-end.sh` schreibt nur einen Logeintrag und startet den separaten Check-Service.
+3. `session-end.sh` schreibt einen Logeintrag und stößt **zwei unabhängige Dinge** an:
+   - einen entkoppelten Cleanup-Job (über `systemd-run`), der `fz-x11vnc@userX` und `fz-xvfb@userX` stoppt
+   - den separaten Shutdown-Check-Service
 4. `fz-grid-shutdown-check.service` ruft `/opt/maintenance/fz-grid-shutdown-check.sh` auf.
 5. Das Check-Skript zählt die laufenden `fz-grid@*.service`-Instanzen.
 6. Nur wenn `0` Instanzen laufen, wird `/opt/maintenance/update-and-shutdown.sh` gestartet.
 7. `update-and-shutdown.sh` führt `apt-get update`, `apt-get upgrade -y`, `apt-get autoremove -y`, `apt-get autoclean` und danach `shutdown -h now` aus.
+
+Wichtig: Schritt 3 (Cleanup von Xvfb/x11vnc der beendeten Instanz) läuft **immer**, auch wenn in Schritt 5 noch andere User aktiv sind und der volle Shutdown deshalb ausbleibt. Nur so werden nicht mehr benötigte Xvfb/x11vnc-Prozesse einzelner User zuverlässig beendet, ohne auf das Beenden aller anderen User zu warten.
 
 ## Warum diese Trennung nötig ist
 
@@ -542,11 +551,19 @@ Der Container soll nur dann Updates ausführen und herunterfahren, wenn keine `f
 
 Ein separater oneshot-Check-Service verhindert genau die Race-Condition, die vorher sichtbar war: Während `ExecStopPost` noch lief, war der `fz-grid`-Dienst aus systemd-Sicht noch nicht vollständig aus dem Stop-Pfad heraus. Dadurch konnte die Instanzzählung zu früh erfolgen oder der Stop-Post-Hook vom Timeout beendet werden.[cite:2][cite:34]
 
+### Warum der Xvfb/x11vnc-Stop über `systemd-run` läuft
+
+`fz-grid@.service` hat `Requires=fz-xvfb@%i.service`. Ein direkter `systemctl stop fz-xvfb@userX` **aus demselben Prozesskontext heraus**, während `fz-grid@userX` sich noch mitten in seiner eigenen Stop-Transaktion befindet (`ExecStopPost` läuft noch), kollidiert wegen dieser Requires-Beziehung mit der laufenden Transaktion. systemd merged oder verwirft den neuen Stop-Job dann stillschweigend — die Xvfb/x11vnc-Instanz bleibt fälschlich aktiv.
+
+`systemd-run` löst das, indem es eine **komplett eigenständige transiente Unit** erzeugt, die außerhalb der Stop-Transaktion von `fz-grid@userX` läuft. Dadurch gibt es keine Abhängigkeitskollision mehr, und der Stop von Xvfb/x11vnc funktioniert zuverlässig, auch während `fz-grid@userX` sich noch selbst beendet.
+
+Ein einfaches `systemctl stop --no-block` reicht **nicht** aus: Auch ohne zu blockieren berechnet systemd die Job-Transaktion inklusive Abhängigkeitsauflösung sofort — genau dort tritt die Kollision auf, nur eben ohne sichtbaren Fehler im Skript-Exitcode.
+
 ## Verwendete Dateien
 
 | Pfad | Zweck |
 |---|---|
-| `/opt/scripts/session-end.sh` | Kurzer Trigger aus `ExecStopPost=`; schreibt Log und startet den Shutdown-Check. |
+| `/opt/scripts/session-end.sh` | Kurzer Trigger aus `ExecStopPost=`; stoppt die Xvfb/x11vnc-Instanz des beendeten Users entkoppelt via `systemd-run` und startet danach den globalen Shutdown-Check. |
 | `/opt/maintenance/fz-grid-shutdown-check.sh` | Prüft, ob noch `fz-grid@*.service`-Instanzen laufen. |
 | `/etc/systemd/system/fz-grid-shutdown-check.service` | oneshot-Service für den Shutdown-Check. |
 | `/opt/maintenance/update-and-shutdown.sh` | Führt Update und Herunterfahren aus. |
@@ -568,15 +585,31 @@ log() {
     echo "$(date '+%F %T') $*" >> "$LOGFILE"
 }
 
-exec 9>"$LOCKFILE"
-if ! flock -n 9; then
-    log "Skippe ${INSTANCE}: anderer session-end Lauf hält bereits den Lock"
+if [[ ! "$INSTANCE" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    log "Ungültiger Instanzname, breche ab: ${INSTANCE}"
     exit 0
 fi
 
 log "Sitzung beendet: ${INSTANCE} | SERVICE_RESULT=${SERVICE_RESULT:-unknown} EXIT_CODE=${EXIT_CODE:-unknown} EXIT_STATUS=${EXIT_STATUS:-unknown}"
 
-systemctl start fz-grid-shutdown-check.service
+# Läuft entkoppelt von der noch laufenden Stop-Transaktion von
+# fz-grid@INSTANCE (siehe Abschnitt "Warum der Xvfb/x11vnc-Stop über
+# systemd-run läuft"). Passiert unabhängig davon, ob andere User
+# noch aktiv sind.
+log "Plane Stop von fz-x11vnc@${INSTANCE} und fz-xvfb@${INSTANCE} über systemd-run (entkoppelt)"
+systemd-run --unit="fz-cleanup-${INSTANCE}-$$" --description="Cleanup ${INSTANCE}" \
+    /bin/bash -c "systemctl stop fz-x11vnc@${INSTANCE}.service fz-xvfb@${INSTANCE}.service" \
+    >>"$LOGFILE" 2>&1
+
+# Nur der globale Shutdown-Check läuft seriell hinter dem Lock,
+# da er nur einmal gleichzeitig laufen darf.
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    log "Skippe Shutdown-Check für ${INSTANCE}: anderer Lauf hält bereits den Lock"
+    exit 0
+fi
+
+systemctl start --no-block fz-grid-shutdown-check.service
 exit 0
 ```
 
@@ -645,6 +678,8 @@ KillSignal=SIGTERM
 | `Failed at step EXEC ... Permission denied` | Check-Skript war nicht ausführbar. | `chmod +x /opt/maintenance/fz-grid-shutdown-check.sh` setzen. |
 | `Failed to parse time specification: noW` | Tippfehler im Shutdown-Befehl. | Exakt `/usr/sbin/shutdown -h now` verwenden.[cite:114] |
 | `Shutdown-Check: kein Marker vorhanden, beende` | Alte Marker-Logik war noch aktiv, obwohl direktes Starten des Check-Service genutzt wird. | Marker-Prüfung entfernen und Check direkt aus `session-end.sh` starten. |
+| Xvfb/x11vnc eines beendeten Users laufen weiter, solange ein anderer User noch aktiv ist | Es gab ursprünglich gar keinen Cleanup-Schritt pro Instanz — nur den globalen Shutdown, der den ganzen Container stoppt. | `session-end.sh` um gezielten Stop von `fz-xvfb@INSTANCE`/`fz-x11vnc@INSTANCE` erweitern. |
+| Xvfb/x11vnc-Stop wird lautlos verworfen, LXC fährt gar nicht mehr herunter | Direkter `systemctl stop` (auch mit `--no-block`) aus `ExecStopPost` heraus kollidiert wegen `Requires=` mit der laufenden Stop-Transaktion von `fz-grid@INSTANCE`. | Stop-Aufruf über `systemd-run` in eine eigenständige, entkoppelte transiente Unit auslagern. |
 
 ## Installation oder Aktualisierung
 
@@ -669,13 +704,21 @@ systemctl daemon-reload
 
 ## Testablauf
 
-1. `systemctl restart fz-grid@user1.service`
-2. Session im Browser regulär schließen.
-3. `tail -f /var/log/session-end.log`
-4. `journalctl -u fz-grid-shutdown-check.service -b --no-pager`
-5. `tail -f /var/log/update-and-shutdown.log`
+1. `systemctl start fz-xvfb@user1 fz-x11vnc@user1 fz-grid@user1`
+2. `systemctl start fz-xvfb@user2 fz-x11vnc@user2 fz-grid@user2`
+3. Session von user1 im Browser regulär schließen.
+4. `tail -f /var/log/session-end.log`
+5. `systemctl is-active fz-xvfb@user1 fz-x11vnc@user1` → sollte nach kurzer Zeit `inactive` sein.
+6. `systemctl is-active fz-xvfb@user2 fz-x11vnc@user2` → sollte weiterhin `active` sein, solange user2 nicht beendet hat.
+7. `journalctl -u "fz-cleanup-user1-*" -b --no-pager` → zeigt den entkoppelten Cleanup-Job für user1.
+8. `journalctl -u fz-grid-shutdown-check.service -b --no-pager` → sollte bei noch aktivem user2 abbrechen ("Abbruch, noch aktiv").
+9. Auch user2 beenden → Shutdown-Check meldet `0` laufende Instanzen, `tail -f /var/log/update-and-shutdown.log` zeigt Update-Lauf und am Ende `=== Fahre System jetzt herunter ===` mit anschließendem Verbindungsabbruch durch den Shutdown.[cite:114]
 
-Wenn der Ablauf korrekt ist, erscheint zuerst der Logeintrag aus `session-end.sh`, danach der Shutdown-Check mit `laufende fz-grid Instanzen: 0`, dann der Update-Lauf und am Ende `=== Fahre System jetzt herunter ===` mit anschließendem Verbindungsabbruch durch den Shutdown.[cite:114]
+## Bekannter Nebeneffekt
+
+Da `ExecStopPost=` bei jedem Stop-Pfad ausgeführt wird — auch bei automatischen Neustarts durch `Restart=on-failure` — stößt `session-end.sh` bei jedem Neustart von `fz-grid@userX` kurz auch den Cleanup-Job für dessen Xvfb/x11vnc an, bevor `Requires=` sie beim nächsten Start automatisch wieder hochzieht. Das ist unschädlich, erzeugt aber zusätzliche `fz-cleanup-*`-Log-Einträge.
+
+Die transienten `fz-cleanup-*`-Units bleiben nach Abschluss als `inactive (dead)` im systemd-Zustand stehen. Das ist harmlos, sammelt aber mit der Zeit Einträge an. Bei Bedarf im Boot-Cleanup (`clear-maintenance-logs.service`) zusätzlich `systemctl reset-failed` bzw. `journalctl --vacuum-time=1d` ergänzen.
 # Börse geschlossen Seite im npmplus
 ```
 mkdir -p /opt/npmplus/trading/html
