@@ -365,7 +365,7 @@ Requires=fz-xvfb@%i.service
 
 [Service]
 EnvironmentFile=/opt/fz-grid/env/%i.env
-ExecStart=/usr/bin/x11vnc -display ${DISPLAY} -rfbport ${VNC_PORT} -nopw -forever -shared -quiet
+ExecStart=/usr/bin/x11vnc -display ${DISPLAY} -rfbport ${VNC_PORT} -nopw -forever -shared -quiet -listen 127.0.0.1
 Restart=on-failure
 RestartSec=3
 SuccessExitStatus=2 15
