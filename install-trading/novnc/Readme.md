@@ -149,9 +149,23 @@ cat <<'EOF' > /opt/npmplus/trading/market_set.sh
 #!/bin/sh
 # Usage: market_set.sh 0|1   (0 = offen, 1 = geschlossen)
 VALUE="$1"
+
+case "$VALUE" in
+  0|1) ;;
+  *) echo "Usage: $0 0|1"; exit 1 ;;
+esac
+
 NEW="set \$market_closed ${VALUE};"
-docker exec npmplus sh -c "echo '${NEW}' > /data/custom_nginx/market_status.conf"
+docker exec npmplus sh -c "echo '${NEW}' > /data/trading/market_status.conf"
 docker exec npmplus nginx -s reload
+
+if [ "$VALUE" = "1" ]; then
+    # Börse geschlossen -> fz-starter stoppen
+    rc-service fz-starter stop
+elif [ "$VALUE" = "0" ]; then
+    # Börse offen -> fz-starter starten
+    rc-service fz-starter start
+fi
 EOF
 chmod +x /opt/npmplus/trading/market_set.sh
 cat <<'EOF' > /opt/npmplus/trading/market_boot_check.sh
