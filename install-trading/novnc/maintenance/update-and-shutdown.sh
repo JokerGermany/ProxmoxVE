@@ -65,7 +65,7 @@ sleep 3
 RUNNING_AFTER="$(count_running_grids)"
 log "Laufende fz-grid Instanzen vor Shutdown: ${RUNNING_AFTER}"
 
-if [ "$RUNNING_AFTER" -ne 0 ]; then
+if [[ "$RUNNING_AFTER" -ne 0 && "$FZ_TRIGGER" != "timer" ]]; then
     log "Abbruch: vor dem Shutdown sind wieder ${RUNNING_AFTER} fz-grid Instanz(en) aktiv"
     exit 0
 fi
