@@ -3,6 +3,11 @@ set -u
 
 LOGFILE="/var/log/update-and-shutdown.log"
 
+# Gesetzt von update-and-shutdown.service (Environment=FZ_TRIGGER=timer).
+# Läuft der Aufruf stattdessen über fz-grid-shutdown-check.sh (exec), ist
+# die Variable nicht gesetzt -> altes, konservatives Verhalten bleibt dort.
+FZ_TRIGGER="${FZ_TRIGGER:-}"
+
 log() {
     echo "$(date '+%F %T') $*" | tee -a "$LOGFILE"
 }
@@ -12,14 +17,18 @@ count_running_grids() {
     | awk '$1 ~ /^fz-grid@.*\.service$/ { c++ } END { print c+0 }'
 }
 
-log "=== Update-Lauf gestartet ==="
+log "=== Update-Lauf gestartet (Trigger: ${FZ_TRIGGER:-event}) ==="
 
 RUNNING_BEFORE="$(count_running_grids)"
 log "Laufende fz-grid Instanzen vor Update: ${RUNNING_BEFORE}"
 
 if [ "$RUNNING_BEFORE" -ne 0 ]; then
-    log "Abbruch: vor dem Update sind noch ${RUNNING_BEFORE} fz-grid Instanz(en) aktiv"
-    exit 0
+    if [ "$FZ_TRIGGER" = "timer" ]; then
+        log "Hinweis: ${RUNNING_BEFORE} fz-grid Instanz(en) noch aktiv, wird wegen Timer-Trigger ignoriert – Update wird trotzdem gestartet"
+    else
+        log "Abbruch: vor dem Update sind noch ${RUNNING_BEFORE} fz-grid Instanz(en) aktiv"
+        exit 0
+    fi
 fi
 
 export DEBIAN_FRONTEND=noninteractive
