@@ -8,9 +8,9 @@ mkdir -p /opt/fz-grid/systemd/ /opt/fz-grid/profiles/user1 /opt/fz-grid/env/
 cd /opt/fz-grid
 npm init -y
 npm install playwright
-npx playwright install --with-deps chromium```
+npx playwright install --with-deps firefox```
 ```
-npmplus (reverse-proxy) ──proxy_pass :8080──▶ Guac+Trading-LXC ──VNC──▶ localhost:5901/5902 ──▶ Xvfb ──▶ Chromium
+npmplus (reverse-proxy) ──proxy_pass :8080──▶ Guac+Trading-LXC ──VNC──▶ localhost:5901/5902 ──▶ Xvfb ──▶ Firefox
 
 ```
 /opt/fz-grid/
@@ -72,7 +72,7 @@ Der eigentliche Shutdown darf **nicht** direkt in einem langen `ExecStopPost`-Ho
 
 ## Finaler Ablauf
 
-1. Chromium wird geschlossen und `runner.js` beendet sich regulär.
+1. Firefox wird geschlossen und `runner.js` beendet sich regulär.
 2. `fz-grid@userX.service` läuft in `ExecStopPost=/opt/scripts/session-end.sh %i`.
 3. `session-end.sh` schreibt einen Logeintrag und stößt **zwei unabhängige Dinge** an:
    - einen entkoppelten Cleanup-Job (über `systemd-run`), der `fz-x11vnc@userX` und `fz-xvfb@userX` stoppt

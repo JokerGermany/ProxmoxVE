@@ -69,11 +69,11 @@ if [[ "$RUNNING_AFTER" -ne 0 && "$FZ_TRIGGER" != "timer" ]]; then
     log "Abbruch: vor dem Shutdown sind wieder ${RUNNING_AFTER} fz-grid Instanz(en) aktiv"
     exit 0
 fi
-    log "Starte Playwright/Chromium Update-Check"
+    log "Starte Playwright/Firefox Update-Check"
     cd /opt/fz-grid || exit 1
     OLD_VERSION=$(npx playwright --version 2>>"$LOGFILE")
     npm install playwright@latest >> "$LOGFILE" 2>&1
-    npx playwright install chromium >> "$LOGFILE" 2>&1
+    npx playwright install firefox >> "$LOGFILE" 2>&1
     NEW_VERSION=$(npx playwright --version 2>>"$LOGFILE")
     log "Playwright Version: ${OLD_VERSION} -> ${NEW_VERSION}"
 

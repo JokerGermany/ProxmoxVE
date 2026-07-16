@@ -1,29 +1,42 @@
 // /opt/fz-grid/runner.js
-// Version: 1.5.0
-// Änderungen in dieser Version:
-// - Neu: Erkennung der Login-Seite (Origin ohne Subpath, z.B. "/" oder "").
-//   Bleibt der Browser 5 Minuten durchgehend auf dieser Login-Seite, ohne
-//   dass zu TARGET_URL (oder einem anderen Subpath) weitergeleitet wird,
-//   wird dies wie ein manuelles Schließen des Browsers behandelt
-//   (context.close() wird aufgerufen -> bestehender close-Handler greift,
-//   inkl. Snapshot + sauberem Exit + ExecStopPost-Kette).
-// - Timer wird bei Navigation weg von der Login-Seite zurückgesetzt.
-// - Zusätzliches Fallback-Polling für SPA-Navigation ohne "framenavigated".
+// Version: 2.0.0 (Firefox-Port)
 //
-// Änderungen aus 1.4.0 (weiterhin enthalten):
-// - Normales manuelles Schließen des Chromium-Fensters wird nicht mehr
-//   vorschnell als Fehler/Crash behandelt.
-// - context.on('close') beendet den Prozess nicht mehr hart sofort.
-// - Kurzer Guard nach Browser-Start, damit ein frühes close-Event
-//   nicht fälschlich als Crash interpretiert wird.
-// - Bestehende Session-Cookie-/sessionStorage-Persistenz beibehalten.
-// - Graceful Shutdown über SIGTERM/SIGINT weiterhin vorhanden.
+// Änderungen in dieser Version:
+// - Browser von Chromium auf Firefox umgestellt (firefox.launchPersistentContext).
+//   Playwright verwendet dabei seinen eigenen, gepatchten Firefox-Build
+//   ("npx playwright install --with-deps firefox"); ein System-Firefox aus apt
+//   wird nicht benutzt und wird von Playwright auch nicht unterstützt.
+// - forceWindowBounds() ersatzlos entfernt: Die Funktion basierte auf CDP
+//   (context.newCDPSession + Browser.setWindowBounds), und CDP steht in
+//   Playwright ausschließlich für Chromium zur Verfügung. Ersatz: die
+//   Firefox-Startargumente --width/--height, abgeleitet aus SCREEN_RES.
+// - Chromium-spezifische Startargumente entfernt (--no-sandbox,
+//   --start-maximized, --window-position, --window-size).
+// - cleanupStaleLocks() auf die Firefox-Lockdateien "lock" und ".parentlock"
+//   umgestellt. "lock" ist ein Symlink auf "IP:+PID" und damit praktisch
+//   immer dangling; fs.existsSync() erkennt dangling Symlinks nicht, daher
+//   lstatSync + rmSync. Die alten Chromium-Lockdateien werden defensiv
+//   weiterhin mit entfernt (Altbestand, falls ein Profil nicht geleert wurde).
+// - Logtexte von "Chromium" auf "Firefox" angepasst; nach dem Laden der
+//   Zielseite wird die tatsächliche innere Fenstergröße geloggt, um die
+//   Wirkung von --width/--height direkt im Journal verifizieren zu können.
+//
+// Unverändert übernommen aus 1.5.0:
+// - Login-Idle-Erkennung: bleibt der Browser 5 Minuten durchgehend auf der
+//   Login-Seite (Origin ohne Subpath, z.B. "/"), wird das wie manuelles
+//   Schließen des Browsers behandelt (context.close() -> close-Handler
+//   inkl. Snapshot, sauberem Exit und ExecStopPost-Kette).
+// - Session-Cookie-/sessionStorage-Persistenz (periodischer Snapshot +
+//   Restore beim Start). Die JSON-Snapshots sind browserneutral und werden
+//   auch beim ersten Firefox-Start wieder eingespielt.
+// - Graceful Shutdown über SIGTERM/SIGINT.
+// - close-Handling: manuelles Schließen des Browserfensters ist kein Fehler.
 
-const { chromium } = require('playwright');
+const { firefox } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-const RUNNER_VERSION = '1.5.0';
+const RUNNER_VERSION = '2.0.0';
 
 const USER_DATA_DIR = process.env.USER_DATA_DIR;
 if (!USER_DATA_DIR) {
@@ -70,16 +83,30 @@ let loginIdleTimer = null;
 let loginPollHandle = null;
 
 function cleanupStaleLocks() {
-  const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
+  // Firefox legt im Profil "lock" (Symlink auf "IP:+PID", fast immer dangling)
+  // und ".parentlock" an. Bleiben sie nach einem harten Kill liegen, startet
+  // Firefox mit "already running, but is not responding" nicht mehr.
+  // Die Chromium-Dateien werden defensiv mit abgeräumt, falls ein Profil-
+  // ordner bei der Migration nicht vollständig geleert wurde.
+  const lockFiles = ['lock', '.parentlock', 'SingletonLock', 'SingletonSocket', 'SingletonCookie'];
+
   for (const f of lockFiles) {
     const p = path.join(USER_DATA_DIR, f);
-    if (fs.existsSync(p)) {
-      try {
-        fs.unlinkSync(p);
-        console.log(`[RUNNER] Entfernt: ${p}`);
-      } catch (err) {
-        console.warn(`[RUNNER] Konnte ${p} nicht entfernen:`, err.message);
-      }
+
+    let exists = false;
+    try {
+      fs.lstatSync(p); // lstat statt existsSync: erkennt auch dangling Symlinks
+      exists = true;
+    } catch {
+      // nicht vorhanden
+    }
+    if (!exists) continue;
+
+    try {
+      fs.rmSync(p, { force: true }); // entfernt Dateien und Symlinks, ohne ihnen zu folgen
+      console.log(`[RUNNER] Entfernt: ${p}`);
+    } catch (err) {
+      console.warn(`[RUNNER] Konnte ${p} nicht entfernen:`, err.message);
     }
   }
 }
@@ -149,27 +176,6 @@ function loadSessionStorageSnapshotForInject() {
   }
 }
 
-async function forceWindowBounds(targetPage, width, height) {
-  try {
-    const client = await context.newCDPSession(targetPage);
-    const { windowId } = await client.send('Browser.getWindowForTarget');
-
-    await client.send('Browser.setWindowBounds', {
-      windowId,
-      bounds: { windowState: 'normal' }
-    });
-
-    await client.send('Browser.setWindowBounds', {
-      windowId,
-      bounds: { left: 0, top: 0, width, height, windowState: 'normal' }
-    });
-
-    console.log(`[RUNNER] Fenstergröße per CDP erzwungen: ${width}x${height}`);
-  } catch (err) {
-    console.warn('[RUNNER] Konnte Fenstergröße per CDP nicht setzen:', err.message);
-  }
-}
-
 // --- Login-Idle-Helper ---
 
 function isLoginOnlyUrl(urlString) {
@@ -230,7 +236,7 @@ async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  console.log(`[RUNNER] Signal ${signal} empfangen – sichere Session-Cookies/sessionStorage und schließe Browser sauber…`);
+  console.log(`[RUNNER] Signal ${signal} empfangen – sichere Session-Cookies/sessionStorage und schließe Firefox sauber…`);
 
   if (snapshotIntervalHandle) clearInterval(snapshotIntervalHandle);
   stopLoginIdleWatch();
@@ -257,7 +263,7 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 async function main() {
-  console.log(`[RUNNER] Version ${RUNNER_VERSION} startet…`);
+  console.log(`[RUNNER] Version ${RUNNER_VERSION} (Firefox) startet…`);
 
   cleanupStaleLocks();
 
@@ -268,20 +274,25 @@ async function main() {
 
   const userscriptCode = fs.readFileSync(USERSCRIPT_PATH, 'utf-8');
 
-  console.log(`[RUNNER] Starte Chromium mit Profil: ${USER_DATA_DIR}`);
+  console.log(`[RUNNER] Starte Firefox (Playwright-Build) mit Profil: ${USER_DATA_DIR}`);
   console.log(`[RUNNER] DISPLAY: ${process.env.DISPLAY || '(nicht gesetzt)'}`);
-  console.log(`[RUNNER] Fenstergröße (Ziel): ${WINDOW_SIZE.width}x${WINDOW_SIZE.height}`);
+  console.log(`[RUNNER] Fenstergröße (Ziel via --width/--height): ${WINDOW_SIZE.width}x${WINDOW_SIZE.height}`);
   console.log(`[RUNNER] Login-Idle-Timeout: ${LOGIN_IDLE_TIMEOUT_MS / 60000} Minuten (Origin ohne Subpath: ${TARGET_ORIGIN}/)`);
 
-  context = await chromium.launchPersistentContext(USER_DATA_DIR, {
+  context = await firefox.launchPersistentContext(USER_DATA_DIR, {
     headless: false,
+    // Kein emulierter Playwright-Viewport: Die Seite nutzt die reale
+    // Fenstergröße, die über --width/--height gesetzt wird.
     viewport: null,
     args: [
-      '--no-sandbox',
-      '--start-maximized',
-      '--window-position=0,0',
-      `--window-size=${WINDOW_SIZE.width},${WINDOW_SIZE.height}`
-    ]
+      `--width=${WINDOW_SIZE.width}`,
+      `--height=${WINDOW_SIZE.height}`
+    ],
+    // Übergabe der Firefox-spezifischen Einstellungen an das Browser-Context
+    firefoxUserPrefs: {
+      'signon.rememberSignons': true, // Aktiviert die Passwort-Manager-Abfragen
+      'ui.popup.disable_autohide': true // Deaktiviert das Dropdowns sich sofort schließen
+    }
   });
 
   await restoreSessionCookiesBeforeNavigation();
@@ -338,7 +349,7 @@ async function main() {
       return;
     }
 
-    console.log('[RUNNER] Chromium wurde vermutlich manuell geschlossen (oder Login-Idle-Timeout ausgelöst) – beende Runner sauber ohne Fehler.');
+    console.log('[RUNNER] Firefox wurde vermutlich manuell geschlossen (oder Login-Idle-Timeout ausgelöst) – beende Runner sauber ohne Fehler.');
     process.exit(0);
   });
 
@@ -350,11 +361,19 @@ async function main() {
 
   page.on('framenavigated', handleFrameNavigation);
 
-  await forceWindowBounds(page, WINDOW_SIZE.width, WINDOW_SIZE.height);
-
   await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded' });
 
   console.log(`[RUNNER] Seite geladen: ${TARGET_URL}`);
+
+  // Diagnose: prüfen, ob --width/--height tatsächlich gegriffen haben.
+  // innerHeight liegt bauartbedingt unter dem Zielwert (Tab-/Adressleiste).
+  try {
+    const size = await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
+    console.log(`[RUNNER] Innere Fenstergröße laut Seite: ${size.w}x${size.h} (Soll außen: ${WINDOW_SIZE.width}x${WINDOW_SIZE.height}, abzüglich Firefox-UI)`);
+  } catch (err) {
+    console.warn('[RUNNER] Konnte Fenstergröße nicht auslesen:', err.message);
+  }
+
   console.log('[RUNNER] Falls kein Login/Freischaltung vorhanden: jetzt über noVNC einmalig durchführen.');
   console.log('[RUNNER] Die Session bleibt danach im Profilordner dauerhaft erhalten.');
 
