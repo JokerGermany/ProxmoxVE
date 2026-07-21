@@ -4,6 +4,7 @@ After=fz-xvfb@%i.service
 Requires=fz-xvfb@%i.service
 
 [Service]
+MemoryHigh=1800M
 EnvironmentFile=/opt/fz-grid/env/%i.env
 WorkingDirectory=/opt/fz-grid
 ExecStart=/usr/bin/node /opt/fz-grid/runner.js

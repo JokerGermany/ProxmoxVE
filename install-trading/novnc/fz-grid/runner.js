@@ -281,18 +281,12 @@ async function main() {
 
   context = await firefox.launchPersistentContext(USER_DATA_DIR, {
     headless: false,
-    // Kein emulierter Playwright-Viewport: Die Seite nutzt die reale
-    // Fenstergröße, die über --width/--height gesetzt wird.
     viewport: null,
-    args: [
-      `--width=${WINDOW_SIZE.width}`,
-      `--height=${WINDOW_SIZE.height}`
-    ],
-    // Übergabe der Firefox-spezifischen Einstellungen an das Browser-Context
     firefoxUserPrefs: {
-      'signon.rememberSignons': true, // Aktiviert die Passwort-Manager-Abfragen
-      'ui.popup.disable_autohide': true // Deaktiviert das Dropdowns sich sofort schließen
+      'signon.rememberSignons': true,
+      'ui.popup.disable_autohide': true
     }
+    // keine args mehr — die Fenstergröße kommt aus dem Xvfb-Screen
   });
 
   await restoreSessionCookiesBeforeNavigation();
