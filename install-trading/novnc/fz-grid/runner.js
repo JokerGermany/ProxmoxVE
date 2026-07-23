@@ -1,5 +1,12 @@
 // /opt/fz-grid/runner.js
-// Version: 2.2.0 (Firefox-Port + speicherbasiertes Browser-Recycling)
+// Version: 2.3.0 (Firefox-Port + speicherbasiertes Browser-Recycling)
+//
+// Neu in 2.3.0:
+// - Create-Locks werden bei jedem echten Runner-PROZESS-Start einmalig geleert
+//   (systemd (re)start, Reboot), NICHT bei einem Browser-Recycle. Umsetzung
+//   über eine pro Prozess eindeutige Boot-ID gegen einen localStorage-Marker;
+//   als erstes Init-Script (vor dem Userscript) ausgeführt. Abschaltbar über
+//   CLEAR_CREATE_LOCKS_ON_START=0.
 //
 // Neu in 2.2.0:
 // - Order-Schutz beim Recycle: ein fälliger Recycle wird aufgeschoben, solange
@@ -68,7 +75,7 @@ const { firefox } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-const RUNNER_VERSION = '2.2.0';
+const RUNNER_VERSION = '2.3.0';
 
 const USER_DATA_DIR = process.env.USER_DATA_DIR;
 if (!USER_DATA_DIR) {
@@ -140,6 +147,24 @@ const RECYCLE_BUSY_URL_FRAGMENT = process.env.RECYCLE_BUSY_URL_FRAGMENT || '/mei
 // (ein Container-Hänger ist das größere Risiko). Der persistente Create-Lock
 // des Userscripts verhindert dabei weiterhin Dubletten. Default 5 Min.
 const RECYCLE_MAX_DEFER_MS = parseInt(process.env.RECYCLE_MAX_DEFER_MS || String(5 * 60 * 1000), 10);
+
+// --- Create-Locks beim Runner-Start entfernen ---
+// Bei jedem echten Runner-PROZESS-Start (systemd (re)start, Reboot) werden die
+// persistenten Create-Locks des Userscripts einmalig geleert – NICHT bei einem
+// Browser-Recycle (der Recycle behält die Locks, damit die Dubletten-Sicherheit
+// erhalten bleibt). Umsetzung: eine pro Prozess eindeutige Boot-ID wird gegen
+// einen in localStorage abgelegten Marker verglichen; nur bei Abweichung
+// (= neuer Prozess) wird gelöscht. Über CLEAR_CREATE_LOCKS_ON_START=0
+// abschaltbar.
+const CLEAR_CREATE_LOCKS_ON_START = process.env.CLEAR_CREATE_LOCKS_ON_START !== '0';
+// Muss exakt dem Key im Userscript entsprechen (RECENT_CREATE_LOCKS_STORAGE_KEY).
+const CREATE_LOCKS_STORAGE_KEY = process.env.CREATE_LOCKS_STORAGE_KEY || 'fz-grid.recentCreateLocks';
+// Marker-Key, unter dem die zuletzt verarbeitete Boot-ID im Profil abgelegt wird.
+const RUNNER_BOOT_MARKER_KEY = 'fz-grid.__runnerBootId';
+// Eindeutig pro Prozessstart (Zeitstempel + PID). Modul-Konstante => wird bei
+// einem Recycle bewusst wiederverwendet, sodass der Recycle den Marker trifft
+// und NICHT löscht.
+const RUNNER_BOOT_ID = `${Date.now()}-${process.pid}`;
 
 let context = null;
 let page = null;
@@ -423,6 +448,31 @@ async function startBrowserSession() {
 
   await restoreSessionCookiesBeforeNavigation();
 
+  // Create-Locks beim echten Runner-Start leeren (nicht beim Recycle).
+  // Läuft als ERSTES Init-Script, also vor dem Userscript – dadurch ist der
+  // Key bereits entfernt, wenn das Userscript ihn per loadCreateLocks() liest.
+  // Die Boot-ID-/Marker-Logik sorgt dafür, dass pro Prozess nur EINMAL (auf der
+  // ersten Navigation) gelöscht wird und ein Recycle (gleiche Boot-ID) nichts
+  // anfasst. localStorage wird vom Runner weder gesnapshotet noch restauriert,
+  // der Marker überlebt also zuverlässig im Profil.
+  if (CLEAR_CREATE_LOCKS_ON_START) {
+    await context.addInitScript(
+      ([bootId, markerKey, locksKey, origin]) => {
+        try {
+          if (window.location.origin !== origin) return; // nur Ziel-Origin anfassen
+          if (localStorage.getItem(markerKey) !== bootId) {
+            localStorage.removeItem(locksKey);
+            localStorage.setItem(markerKey, bootId);
+            console.log('[FZ-GRID-BOOT] Neuer Runner-Start erkannt – Create-Locks entfernt.');
+          }
+        } catch (e) {
+          console.warn('[FZ-GRID-BOOT] Konnte Create-Locks nicht entfernen:', e && e.message);
+        }
+      },
+      [RUNNER_BOOT_ID, RUNNER_BOOT_MARKER_KEY, CREATE_LOCKS_STORAGE_KEY, TARGET_ORIGIN]
+    );
+  }
+
   const storedSessionStorage = loadSessionStorageSnapshotForInject();
   const storedKeys = Object.keys(storedSessionStorage);
 
@@ -575,8 +625,6 @@ async function recycleBrowser() {
   }
 }
 
-// Startet den periodischen Speicher-Watchdog. Läuft dauerhaft über alle
-// Recycles hinweg und wird nur beim Shutdown/echten Schließen gestoppt.
 // True, wenn die aktuelle Seite auf der Order-Eingabe/-Bestätigung steht.
 // page.url() ist ein synchroner Getter (letzte bekannte URL); wirft nicht,
 // aber defensiv abgesichert.
@@ -675,6 +723,7 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 async function main() {
   console.log(`[RUNNER] Version ${RUNNER_VERSION} (Firefox) startet…`);
+  console.log(`[RUNNER] Boot-ID: ${RUNNER_BOOT_ID}; Create-Locks beim Runner-Start entfernen: ${CLEAR_CREATE_LOCKS_ON_START ? 'ja' : 'nein'}.`);
 
   cleanupStaleLocks();
 
