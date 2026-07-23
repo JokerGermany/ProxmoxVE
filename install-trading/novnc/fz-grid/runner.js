@@ -1,7 +1,39 @@
 // /opt/fz-grid/runner.js
-// Version: 2.0.0 (Firefox-Port)
+// Version: 2.2.0 (Firefox-Port + speicherbasiertes Browser-Recycling)
 //
-// Änderungen in dieser Version:
+// Neu in 2.2.0:
+// - Order-Schutz beim Recycle: ein fälliger Recycle wird aufgeschoben, solange
+//   die Seite auf der Order-Eingabe/-Bestätigung steht (URL-Fragment
+//   /meindepot/kaufenverkaufen), damit der Browser nicht mitten in einer
+//   Echtgeld-Order geschlossen wird. Sicherheitsventil: nach RECYCLE_MAX_DEFER_MS
+//   (Default 5 Min) wird trotzdem recycelt, damit ein hängender Vorgang den
+//   Speicherschutz nicht aushebelt. Der persistente Create-Lock des Userscripts
+//   verhindert dabei weiterhin Dubletten.
+//
+// Neu in 2.1.1:
+// - Speichermessung primär über die eigene cgroup (memory.current, cgroup v2)
+//   statt /proc-RSS-Summe. Deckt sich mit "systemctl show -p MemoryCurrent"
+//   und ist so direkt kalibrierbar; /proc-RSS bleibt als Fallback.
+// - Default-Schwellwert von 3000 auf 1500 MB gesenkt. Der alte Wert war für
+//   eine Einzelinstanz praktisch nie erreichbar, weshalb der Recycle nie
+//   auslöste, obwohl zwei Instanzen zusammen den Container füllten.
+//
+// Neu in 2.1.0:
+// - Speicherbasiertes Browser-Recycling: ein Watchdog prüft periodisch die
+//   RSS-Summe des eigenen Prozessbaums (node + Firefox + Content-Prozesse,
+//   gelesen aus /proc). Überschreitet sie RECYCLE_RSS_THRESHOLD_MB, wird der
+//   Firefox-Kontext geschlossen und neu gestartet, OHNE den Runner oder die
+//   systemd-Unit zu beenden. Dadurch wird der Firefox-Speicher freigegeben,
+//   ohne den ExecStopPost-/Shutdown-Check-Pfad auszulösen.
+// - Der Browser-Aufbau wurde aus main() in startBrowserSession() ausgelagert
+//   und wird sowohl beim Erststart als auch bei jedem Recycle aufgerufen.
+// - Der context.on('close')-Handler unterscheidet jetzt einen gewollten
+//   Recycle (recycling==true -> tut nichts) vom echten/ manuellen Schließen.
+// - Login, localStorage (inkl. Anti-Dubletten-Locks des Userscripts) bleiben
+//   im Profil erhalten; Session-Cookies/sessionStorage werden vor jedem
+//   Recycle per snapshotAll() gesichert und beim Neustart wiederhergestellt.
+//
+// Änderungen in 2.0.0:
 // - Browser von Chromium auf Firefox umgestellt (firefox.launchPersistentContext).
 //   Playwright verwendet dabei seinen eigenen, gepatchten Firefox-Build
 //   ("npx playwright install --with-deps firefox"); ein System-Firefox aus apt
@@ -36,7 +68,7 @@ const { firefox } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-const RUNNER_VERSION = '2.0.0';
+const RUNNER_VERSION = '2.2.0';
 
 const USER_DATA_DIR = process.env.USER_DATA_DIR;
 if (!USER_DATA_DIR) {
@@ -73,6 +105,42 @@ const CONTEXT_CLOSE_GUARD_MS = 4000;
 const LOGIN_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 Minuten
 const LOGIN_POLL_INTERVAL_MS = 15000;        // Fallback-Polling für SPA-Navigation
 
+// --- Speicherbasiertes Browser-Recycling ---
+// Schwellwert der Speichernutzung DIESER Instanz. Primär wird die eigene
+// cgroup-Speichermenge gemessen (memory.current, cgroup v2) – exakt der Wert,
+// den auch "systemctl show fz-grid@userX -p MemoryCurrent" liefert; dadurch
+// direkt am Graphen/systemctl kalibrierbar. Fallback: RSS-Summe des eigenen
+// Prozessbaums aus /proc. Wird der Schwellwert überschritten, wird der
+// Firefox-Kontext neu gestartet.
+//
+// WICHTIG zur Dimensionierung: der Schwellwert gilt PRO Instanz. Bei zwei
+// Instanzen im selben Container muss gelten:
+//   2 * THRESHOLD + Baseline  <  Container-RAM
+// Beobachtung (2026-07-21): eine Einzelinstanz startet bei ~0,8 GiB und
+// erreichte im Peak ~2 GiB; zwei Instanzen füllten den 4-GiB-Container bis
+// zum Hänger. Der frühere Default 3000 MB war für eine Einzelinstanz nie
+// erreichbar -> Recycle löste nie aus. Neuer Default daher 1500 MB
+// (2 * 1500 = 3000 MB, lässt in einem 4-GiB-Container Puffer). Pro Instanz
+// über RECYCLE_RSS_THRESHOLD_MB in der .env übersteuerbar.
+const RECYCLE_RSS_THRESHOLD_MB = parseInt(process.env.RECYCLE_RSS_THRESHOLD_MB || '1500', 10);
+const RECYCLE_CHECK_INTERVAL_MS = 60 * 1000;     // Prüfintervall des Watchdogs
+const RECYCLE_MIN_INTERVAL_MS = 5 * 60 * 1000;   // Mindestabstand zwischen zwei Recycles (Thrash-Schutz)
+const PAGE_SIZE_BYTES = 4096;                    // /proc/<pid>/statm rechnet in Seiten (Fallback-Messung)
+// DEBUG_RSS=1 in der .env loggt bei jeder Prüfung den aktuellen Messwert
+// (nützlich zum Kalibrieren des Schwellwerts). Standardmäßig aus.
+const CONFIG_DEBUG_RSS = process.env.DEBUG_RSS === '1';
+
+// --- Order-Schutz beim Recycle ---
+// Steht die Seite auf der Order-Eingabe/-Bestätigung (URL enthält dieses
+// Fragment), wird ein fälliger Recycle aufgeschoben, damit der Browser nicht
+// mitten in einer laufenden Echtgeld-Order geschlossen wird.
+const RECYCLE_BUSY_URL_FRAGMENT = process.env.RECYCLE_BUSY_URL_FRAGMENT || '/meindepot/kaufenverkaufen';
+// Sicherheitsventil: nach dieser Zeit wird trotz Order-Verdacht recycelt,
+// damit ein hängender Vorgang den Speicherschutz nicht dauerhaft aushebelt
+// (ein Container-Hänger ist das größere Risiko). Der persistente Create-Lock
+// des Userscripts verhindert dabei weiterhin Dubletten. Default 5 Min.
+const RECYCLE_MAX_DEFER_MS = parseInt(process.env.RECYCLE_MAX_DEFER_MS || String(5 * 60 * 1000), 10);
+
 let context = null;
 let page = null;
 let shuttingDown = false;
@@ -81,6 +149,11 @@ let startupCompleted = false;
 let contextClosedHandled = false;
 let loginIdleTimer = null;
 let loginPollHandle = null;
+let userscriptCode = null;      // einmalig in main() gelesen, in startBrowserSession() genutzt
+let recycling = false;          // true während eines gewollten Browser-Recycles
+let recycleCheckHandle = null;  // Interval-Handle des Speicher-Watchdogs
+let lastRecycleTs = 0;          // Zeitpunkt des letzten Recycles (Thrash-Schutz)
+let recycleDeferSinceTs = 0;    // seit wann ein fälliger Recycle wg. laufender Order aufgeschoben wird (0 = kein Aufschub)
 
 function cleanupStaleLocks() {
   // Firefox legt im Profil "lock" (Symlink auf "IP:+PID", fast immer dangling)
@@ -232,48 +305,107 @@ function stopLoginIdleWatch() {
   }
 }
 
-async function gracefulShutdown(signal) {
-  if (shuttingDown) return;
-  shuttingDown = true;
+// --- Speicher-Ermittlung ------------------------------------------------
 
-  console.log(`[RUNNER] Signal ${signal} empfangen – sichere Session-Cookies/sessionStorage und schließe Firefox sauber…`);
-
-  if (snapshotIntervalHandle) clearInterval(snapshotIntervalHandle);
-  stopLoginIdleWatch();
-
+// Summiert den RSS (Resident Set Size) des Prozessbaums ab rootPid, indem
+// /proc gelesen wird: /proc/<pid>/stat liefert die PPID (für den Baum),
+// /proc/<pid>/statm Feld 2 die resident pages. Da node hier nur einen
+// schweren Kind-Prozessbaum hat (Firefox + Content-Prozesse), ergibt
+// rootPid = process.pid praktisch den Gesamtspeicher des Dienstes.
+// Hinweis: geteilte Seiten werden pro Prozess mitgezählt, die Summe
+// überschätzt den realen Verbrauch also leicht – für einen Schwellwert ist
+// das unkritisch und eher konservativ. Gibt Bytes zurück oder null, wenn
+// /proc nicht lesbar ist.
+function getProcessTreeRssBytes(rootPid) {
+  let entries;
   try {
-    await snapshotAll();
+    entries = fs.readdirSync('/proc').filter(name => /^\d+$/.test(name));
   } catch (err) {
-    console.error('[RUNNER] Fehler beim finalen Snapshot:', err);
+    console.warn('[RUNNER] /proc nicht lesbar, RSS-Prüfung übersprungen:', err.message);
+    return null;
   }
 
-  try {
-    if (context) {
-      await context.close();
-      console.log('[RUNNER] Browser-Kontext sauber geschlossen.');
+  // PPID je PID einlesen
+  const ppidOf = new Map();
+  for (const name of entries) {
+    try {
+      const stat = fs.readFileSync(`/proc/${name}/stat`, 'utf-8');
+      // comm (Feld 2) kann Leerzeichen/Klammern enthalten -> ab letzter ')' parsen.
+      // Danach folgt: state ppid ... -> ppid ist das zweite Token.
+      const rest = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+      const ppid = parseInt(rest[1], 10);
+      const pid = parseInt(name, 10);
+      if (Number.isFinite(ppid)) ppidOf.set(pid, ppid);
+    } catch {
+      // Prozess kann zwischenzeitlich verschwunden sein
     }
-  } catch (err) {
-    console.error('[RUNNER] Fehler beim sauberen Schließen des Kontexts:', err);
-  } finally {
-    process.exit(0);
+  }
+
+  // Nachkommen von rootPid sammeln (inkl. rootPid selbst)
+  const inTree = new Set([rootPid]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [pid, ppid] of ppidOf) {
+      if (!inTree.has(pid) && inTree.has(ppid)) {
+        inTree.add(pid);
+        changed = true;
+      }
+    }
+  }
+
+  let totalBytes = 0;
+  for (const pid of inTree) {
+    try {
+      const statm = fs.readFileSync(`/proc/${pid}/statm`, 'utf-8').trim().split(/\s+/);
+      const residentPages = parseInt(statm[1], 10);
+      if (Number.isFinite(residentPages)) totalBytes += residentPages * PAGE_SIZE_BYTES;
+    } catch {
+      // Prozess weg -> ignorieren
+    }
+  }
+  return totalBytes;
+}
+
+// Liest die Speichermenge der eigenen cgroup (cgroup v2: memory.current).
+// Das ist derselbe Wert wie "systemctl show <unit> -p MemoryCurrent" und
+// erfasst node + Firefox + alle Content-Prozesse dieser Instanz ohne
+// Doppelzählung geteilter Seiten. Gibt Bytes zurück oder null, wenn cgroup v2
+// nicht verfügbar/lesbar ist (dann greift der /proc-RSS-Fallback).
+function getOwnCgroupMemoryBytes() {
+  try {
+    const cg = fs.readFileSync('/proc/self/cgroup', 'utf-8');
+    // cgroup v2: genau eine Zeile der Form "0::/<pfad>"
+    const line = cg.split('\n').find(l => l.startsWith('0::'));
+    if (!line) return null; // vermutlich cgroup v1 -> Fallback
+    const rel = line.slice(3).trim(); // Teil nach "0::"
+    const p = `/sys/fs/cgroup${rel}/memory.current`;
+    const raw = fs.readFileSync(p, 'utf-8').trim();
+    const bytes = parseInt(raw, 10);
+    return Number.isFinite(bytes) ? bytes : null;
+  } catch {
+    return null;
   }
 }
 
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+// Liefert den aktuellen Speicher-Messwert dieser Instanz in Bytes zusammen mit
+// der verwendeten Quelle ('cgroup' bevorzugt, sonst 'proc-rss'). null, wenn
+// keine Messung möglich ist.
+function measureInstanceMemory() {
+  const cg = getOwnCgroupMemoryBytes();
+  if (cg !== null) return { bytes: cg, source: 'cgroup' };
+  const rss = getProcessTreeRssBytes(process.pid);
+  if (rss !== null) return { bytes: rss, source: 'proc-rss' };
+  return null;
+}
 
-async function main() {
-  console.log(`[RUNNER] Version ${RUNNER_VERSION} (Firefox) startet…`);
+// --- Browser-Session-Aufbau (Erststart und Recycle) ---------------------
 
-  cleanupStaleLocks();
-
-  if (!fs.existsSync(USERSCRIPT_PATH)) {
-    console.error(`[RUNNER] Fehler: userscript.js nicht gefunden unter ${USERSCRIPT_PATH}`);
-    process.exit(1);
-  }
-
-  const userscriptCode = fs.readFileSync(USERSCRIPT_PATH, 'utf-8');
-
+// Baut einen frischen Firefox-Kontext auf: Cookies/sessionStorage-Restore,
+// Init-Scripts (sessionStorage + Userscript), Event-Handler, Zielseite und
+// die pro-Session-Timer (Login-Poll + Snapshot). Wird beim Erststart aus
+// main() und bei jedem Recycle aus recycleBrowser() aufgerufen.
+async function startBrowserSession() {
   console.log(`[RUNNER] Starte Firefox (Playwright-Build) mit Profil: ${USER_DATA_DIR}`);
   console.log(`[RUNNER] DISPLAY: ${process.env.DISPLAY || '(nicht gesetzt)'}`);
   console.log(`[RUNNER] Fenstergröße (Ziel via --width/--height): ${WINDOW_SIZE.width}x${WINDOW_SIZE.height}`);
@@ -318,10 +450,16 @@ async function main() {
   });
 
   context.on('close', async () => {
+    // Gewollter Recycle: der Kontext wird absichtlich geschlossen, der
+    // Neuaufbau übernimmt recycleBrowser(). Hier NICHTS tun (kein Exit,
+    // kein Cleanup, kein Snapshot).
+    if (recycling) return;
+
     if (contextClosedHandled) return;
     contextClosedHandled = true;
 
     if (snapshotIntervalHandle) clearInterval(snapshotIntervalHandle);
+    if (recycleCheckHandle) { clearInterval(recycleCheckHandle); recycleCheckHandle = null; }
     stopLoginIdleWatch();
 
     if (shuttingDown) {
@@ -368,8 +506,11 @@ async function main() {
     console.warn('[RUNNER] Konnte Fenstergröße nicht auslesen:', err.message);
   }
 
-  console.log('[RUNNER] Falls kein Login/Freischaltung vorhanden: jetzt über noVNC einmalig durchführen.');
-  console.log('[RUNNER] Die Session bleibt danach im Profilordner dauerhaft erhalten.');
+  // Nur beim Erststart die einmalige Login-Hinweismeldung ausgeben.
+  if (!startupCompleted) {
+    console.log('[RUNNER] Falls kein Login/Freischaltung vorhanden: jetzt über noVNC einmalig durchführen.');
+    console.log('[RUNNER] Die Session bleibt danach im Profilordner dauerhaft erhalten.');
+  }
 
   // Initialen Login-Status prüfen (falls goto direkt auf der Login-Seite landet,
   // z.B. weil die Session abgelaufen ist)
@@ -382,11 +523,179 @@ async function main() {
   snapshotIntervalHandle = setInterval(() => {
     snapshotAll().catch(err => console.warn('[RUNNER] Periodischer Snapshot fehlgeschlagen:', err.message));
   }, SNAPSHOT_INTERVAL_MS);
+}
+
+// --- Browser-Recycle ----------------------------------------------------
+
+// Schließt den aktuellen Firefox-Kontext und baut ihn frisch wieder auf,
+// ohne den Node-Runner oder die systemd-Unit zu beenden. Der Firefox-Speicher
+// wird dadurch an das OS zurückgegeben. Login/localStorage bleiben über das
+// persistente Profil erhalten, Cookies/sessionStorage über den Snapshot.
+async function recycleBrowser() {
+  if (shuttingDown || recycling) return;
+  recycling = true;
+  const startedAt = Date.now();
+  console.log('[RUNNER] Browser-Recycle: sichere Session-Zustand und starte Firefox neu…');
+
+  try {
+    // Pro-Session-Timer der alten Session stoppen (NICHT den Watchdog).
+    if (snapshotIntervalHandle) { clearInterval(snapshotIntervalHandle); snapshotIntervalHandle = null; }
+    stopLoginIdleWatch();
+
+    // Zustand sichern, solange die alte Seite noch offen ist.
+    await snapshotAll();
+
+    // Alten Kontext schließen. Der close-Handler kehrt wegen recycling==true
+    // sofort zurück und macht nichts.
+    if (context) {
+      await context.close();
+    }
+    context = null;
+    page = null;
+
+    // Firefox-Lockdateien im Profil abräumen, sonst startet der neue Firefox
+    // evtl. mit "already running, but is not responding" nicht.
+    cleanupStaleLocks();
+
+    // Falls während des Recycles ein Shutdown-Signal kam, nicht neu aufbauen.
+    if (shuttingDown) {
+      console.log('[RUNNER] Shutdown während Recycle erkannt – baue keinen neuen Kontext mehr auf.');
+      return;
+    }
+
+    await startBrowserSession();
+
+    lastRecycleTs = Date.now();
+    console.log(`[RUNNER] Browser-Recycle abgeschlossen in ${Date.now() - startedAt} ms.`);
+  } catch (err) {
+    console.error('[RUNNER] Browser-Recycle fehlgeschlagen – beende Runner, systemd startet via Restart=on-failure neu:', err);
+    process.exit(1);
+  } finally {
+    recycling = false;
+  }
+}
+
+// Startet den periodischen Speicher-Watchdog. Läuft dauerhaft über alle
+// Recycles hinweg und wird nur beim Shutdown/echten Schließen gestoppt.
+// True, wenn die aktuelle Seite auf der Order-Eingabe/-Bestätigung steht.
+// page.url() ist ein synchroner Getter (letzte bekannte URL); wirft nicht,
+// aber defensiv abgesichert.
+function isOrderInProgress() {
+  try {
+    if (!page || page.isClosed()) return false;
+    const u = page.url() || '';
+    return u.includes(RECYCLE_BUSY_URL_FRAGMENT);
+  } catch {
+    return false;
+  }
+}
+
+// Startet den periodischen Speicher-Watchdog. Läuft dauerhaft über alle
+// Recycles hinweg und wird nur beim Shutdown/echten Schließen gestoppt.
+function startRecycleWatch() {
+  if (recycleCheckHandle) return;
+
+  // Einmalig ermitteln und loggen, welche Messquelle greift.
+  const initial = measureInstanceMemory();
+  const src = initial ? initial.source : 'keine (Messung nicht möglich)';
+  console.log(`[RUNNER] Speicher-Watchdog aktiv: Recycle bei Speicher > ${RECYCLE_RSS_THRESHOLD_MB} MB ` +
+              `(Messquelle: ${src}, Prüfintervall ${RECYCLE_CHECK_INTERVAL_MS / 1000}s, ` +
+              `Mindestabstand ${RECYCLE_MIN_INTERVAL_MS / 60000} Min, ` +
+              `Order-Schutz bei URL-Fragment "${RECYCLE_BUSY_URL_FRAGMENT}", max. Aufschub ${RECYCLE_MAX_DEFER_MS / 60000} Min).`);
+
+  recycleCheckHandle = setInterval(() => {
+    if (shuttingDown || recycling) return;
+    if (!startupCompleted) return;
+    if (Date.now() - lastRecycleTs < RECYCLE_MIN_INTERVAL_MS) return;
+
+    const m = measureInstanceMemory();
+    if (m === null) return;
+    const mb = Math.round(m.bytes / (1024 * 1024));
+
+    if (mb <= RECYCLE_RSS_THRESHOLD_MB) {
+      recycleDeferSinceTs = 0; // Schwelle unterschritten -> kein Aufschub nötig
+      if (CONFIG_DEBUG_RSS) {
+        console.log(`[RUNNER] Speicher ${mb} MB (${m.source}), Schwellwert ${RECYCLE_RSS_THRESHOLD_MB} MB.`);
+      }
+      return;
+    }
+
+    // Schwelle überschritten -> Recycle gewünscht. Läuft gerade eine Order?
+    if (isOrderInProgress()) {
+      if (recycleDeferSinceTs === 0) recycleDeferSinceTs = Date.now();
+      const deferredMs = Date.now() - recycleDeferSinceTs;
+
+      if (deferredMs < RECYCLE_MAX_DEFER_MS) {
+        console.log(`[RUNNER] Recycle aufgeschoben: Order-Vorgang aktiv (URL enthält "${RECYCLE_BUSY_URL_FRAGMENT}"), ` +
+                    `Speicher ${mb} MB. Warte (seit ${Math.round(deferredMs / 1000)}s, max ${RECYCLE_MAX_DEFER_MS / 60000} Min).`);
+        return;
+      }
+
+      console.warn(`[RUNNER] Recycle trotz laufendem Order-Vorgang erzwungen: max. Aufschub (${RECYCLE_MAX_DEFER_MS / 60000} Min) ` +
+                   `überschritten, Speicher ${mb} MB. Der persistente Create-Lock verhindert Dubletten; eine evtl. nicht ` +
+                   `abgeschlossene Order bleibt gesperrt, bis eine neue Verkaufs-Ausführung sie freigibt.`);
+    }
+
+    recycleDeferSinceTs = 0;
+    console.log(`[RUNNER] Speicher ${mb} MB (${m.source}) > Schwellwert ${RECYCLE_RSS_THRESHOLD_MB} MB – starte Browser-Recycle.`);
+    recycleBrowser().catch(err => console.error('[RUNNER] recycleBrowser Fehler:', err));
+  }, RECYCLE_CHECK_INTERVAL_MS);
+}
+
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`[RUNNER] Signal ${signal} empfangen – sichere Session-Cookies/sessionStorage und schließe Firefox sauber…`);
+
+  if (snapshotIntervalHandle) clearInterval(snapshotIntervalHandle);
+  if (recycleCheckHandle) { clearInterval(recycleCheckHandle); recycleCheckHandle = null; }
+  stopLoginIdleWatch();
+
+  try {
+    await snapshotAll();
+  } catch (err) {
+    console.error('[RUNNER] Fehler beim finalen Snapshot:', err);
+  }
+
+  try {
+    if (context) {
+      await context.close();
+      console.log('[RUNNER] Browser-Kontext sauber geschlossen.');
+    }
+  } catch (err) {
+    console.error('[RUNNER] Fehler beim sauberen Schließen des Kontexts:', err);
+  } finally {
+    process.exit(0);
+  }
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+async function main() {
+  console.log(`[RUNNER] Version ${RUNNER_VERSION} (Firefox) startet…`);
+
+  cleanupStaleLocks();
+
+  if (!fs.existsSync(USERSCRIPT_PATH)) {
+    console.error(`[RUNNER] Fehler: userscript.js nicht gefunden unter ${USERSCRIPT_PATH}`);
+    process.exit(1);
+  }
+
+  // in die globale Variable lesen, damit startBrowserSession() den Code
+  // auch bei jedem Recycle wiederverwenden kann.
+  userscriptCode = fs.readFileSync(USERSCRIPT_PATH, 'utf-8');
+
+  await startBrowserSession();
 
   setTimeout(() => {
     startupCompleted = true;
     console.log('[RUNNER] Startphase abgeschlossen.');
   }, CONTEXT_CLOSE_GUARD_MS);
+
+  // Speicher-Watchdog erst nach dem Erststart aktivieren.
+  startRecycleWatch();
 
   await new Promise(() => {});
 }
