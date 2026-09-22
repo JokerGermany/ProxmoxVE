@@ -326,7 +326,7 @@ Vor
 Folgendes hinzufügen
 ```
 [Max-Paperless]
-path = /opt/ncdata/data/scan-staging/user1/Personal
+path = /opt/ncdata/data/scan-staging/user1/
 browsable = yes
 read only = no
 guest ok = no
