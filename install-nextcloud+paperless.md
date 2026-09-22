@@ -164,7 +164,7 @@ set -euo pipefail
 
 # Config file with one "STAGING|CONSUME" pair per line (see .conf.example).
 # Override with the CONFIG env var or as first argument.
-CONFIG="${CONFIG:-${1:-/mnt/cloud-config/skripts/paperless-scan-mover.conf}}"
+CONFIG="${CONFIG:-${1:-/etc/paperless-scan-mover.conf}}"
 
 # close_write is the normal, reliable path (moves instantly). The sweep is ONLY
 # a last-resort cleaner for abnormal cases where no close_write arrived (server
@@ -242,8 +242,12 @@ process() {
 sweep() {
     local staging f
     for staging in "${WATCH_DIRS[@]}"; do
-        for f in "$staging"/*; do [ -e "$f" ] && process "$staging" "$f" sweep; done
+        for f in "$staging"/*; do
+            [ -e "$f" ] || continue
+            process "$staging" "$f" sweep
+        done
     done
+    return 0   # never let an empty-glob test bubble up as non-zero under `set -e`
 }
 
 ( while true; do sleep "$SWEEP_INTERVAL"; sweep; done ) &
