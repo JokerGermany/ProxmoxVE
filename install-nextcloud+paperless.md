@@ -164,7 +164,7 @@ set -euo pipefail
 
 # Config file with one "STAGING|CONSUME" pair per line (see .conf.example).
 # Override with the CONFIG env var or as first argument.
-CONFIG="${CONFIG:-${1:-/etc/paperless-scan-mover.conf}}"
+CONFIG="${CONFIG:-${1:-/mnt/cloud-config/skripts/paperless-scan-mover.conf}}"
 
 # close_write is the normal, reliable path (moves instantly). The sweep is ONLY
 # a last-resort cleaner for abnormal cases where no close_write arrived (server
