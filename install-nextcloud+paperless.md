@@ -1,26 +1,26 @@
 # Nextcloud
-Container Installation anfangen und aufhören wenn gefragt wird ob NextCloudPi installiert wird
-https://community-scripts.github.io/ProxmoxVE/scripts?id=nextcloudpi
-Dann die DB und Dateien einhängen
-
+Es wird Nextcloud Turnkey verwendet
 /mnt/cloud-config - 5GB
 ```
 mkdir -p /mnt/cloud-config/mysql /mnt/cloud-config/nextcloud /mnt/cloud-config/skripts
+systemctl stop apache2 mariadb
+mv /var/lib/mysql /mnt/cloud-config/mysql
+mv /var/www/nextcloud /mnt/cloud-config/nextcloud
 ln -s /mnt/cloud-config/mysql /var/lib/mysql
 ln -s /mnt/cloud-config/nextcloud /var/www/nextcloud
 ```
-Anschließend die NextcloudPi Installation starten.
-Anschließend init machen
+
+Wenn Postgress:
 danach die Migration starten:
 https://github.com/JokerGermany/ProxmoxVE/blob/main/migrate-nc_postgres_docker%20-%3E%20nextcloudpi.md
 
 Auf Proxmox:
 ```
-chown -R 100033:100033 /mnt/wichtig/cloud
+chown -R 100033:100033 /Raid6-1/wichtig/cloud/
 ```
 
 ```
-pct set 113 -mp1 /mnt/wichtig/cloud,mp=/opt/ncdata/data
+pct set 113 -mp1 /Raid6-1/wichtig/cloud,mp=/Raid6-1/wichtig/cloud
 ```
 
 # Paperless
@@ -40,10 +40,10 @@ mv /opt/* /mnt/paperless/opt/
 rmdir opt
 ln -s /mnt/paperless/opt /opt
 
-pct set 114 -mp1 /mnt/wichtig/cloud/MaxMustermann/files/Sync/Dokumente/paperless/archive,mp=/mnt/paperless/opt/paperless_data/media/documents/archive/MaxMustermann
-pct set 114 -mp2 /mnt/wichtig/cloud/MaxMustermann/files/Sync/Dokumente/paperless/originals,mp=/mnt/paperless/opt/paperless_data/media/documents/originals/MaxMustermann
-pct set 114 -mp3 /mnt/wichtig/cloud/MaxMustermann/files/Sync/Dokumente/paperless/consume/Max,mp=/mnt/paperless/opt/paperless_data/consume/MaxMustermann/Max
-pct set 114 -mp4 /mnt/wichtig/cloud/MaxMustermann/files/Sync/Dokumente/paperless/consume/Familie,mp=/mnt/paperless/opt/paperless_data/consume/MaxMustermann/Familie
+pct set 114 -mp1 /Raid6-1/wichtig/cloud/MaxMustermann/files/Sync/Dokumente/paperless/archive,mp=/mnt/paperless/opt/paperless_data/media/documents/archive/MaxMustermann
+pct set 114 -mp2 /Raid6-1/wichtig/cloud/MaxMustermann/files/Sync/Dokumente/paperless/originals,mp=/mnt/paperless/opt/paperless_data/media/documents/originals/MaxMustermann
+pct set 114 -mp3 /Raid6-1/wichtig/cloud/MaxMustermann/files/Sync/Dokumente/paperless/consume/Max,mp=/mnt/paperless/opt/paperless_data/consume/MaxMustermann/Max
+pct set 114 -mp4 /Raid6-1/wichtig/cloud/MaxMustermann/files/Sync/Dokumente/paperless/consume/Familie,mp=/mnt/paperless/opt/paperless_data/consume/MaxMustermann/Familie
 
 systemctl start postgresql
 systemctl start --all paperless-*
@@ -65,7 +65,7 @@ vi /mnt/cloud-config/skripts/paperless-scanner.sh
 # Definition der zu überwachenden Verzeichnisse (Physikalische Pfade im LXC)
 # Wir überwachen jeweils den Haupt-Ordner "paperless" pro User
 declare -A WATCH_MAP
-WATCH_MAP["/opt/ncdata/data/MaxMustermann/files/Sync/Dokumente/paperless"]="MaxMustermann/files/Sync/Dokumente/paperless"
+WATCH_MAP["/Raid6-1/wichtig/cloud/MaxMustermann/files/Sync/Dokumente/paperless"]="MaxMustermann/files/Sync/Dokumente/paperless"
 ...
 
 LOCK_DIR="/dev/shm/nc_locks"
@@ -275,10 +275,10 @@ done
 #
 # STAGING|CONSUME
 
-/opt/ncdata/data/scan-staging/user1/Personal|/opt/ncdata/data/User1/files/Sync/Documents/paperless/consume/Personal
-/opt/ncdata/data/scan-staging/user1/Family|/opt/ncdata/data/User1/files/Sync/Documents/paperless/consume/Family
-/opt/ncdata/data/scan-staging/user2/Personal|/opt/ncdata/data/User2/files/Sync/Documents/paperless/consume/Personal
-/opt/ncdata/data/scan-staging/user2/Family|/opt/ncdata/data/User2/files/Sync/Documents/paperless/consume/Family
+/Raid6-1/wichtig/cloud/scan-staging/user1/Personal|/Raid6-1/wichtig/cloud/User1/files/Sync/Documents/paperless/consume/Personal
+/Raid6-1/wichtig/cloud/scan-staging/user1/Family|/Raid6-1/wichtig/cloud/User1/files/Sync/Documents/paperless/consume/Family
+/Raid6-1/wichtig/cloud/scan-staging/user2/Personal|/Raid6-1/wichtig/cloud/User2/files/Sync/Documents/paperless/consume/Personal
+/Raid6-1/wichtig/cloud/scan-staging/user2/Family|/Raid6-1/wichtig/cloud/User2/files/Sync/Documents/paperless/consume/Family
 ```
 Nicht vergessen die Ordner zu erstellen
 
@@ -308,7 +308,7 @@ WantedBy=multi-user.target
 ```
 
 ```
-chown -R www-data:www-data /opt/ncdata/data/scan-staging
+chown -R www-data:www-data /Raid6-1/wichtig/cloud/scan-staging
 chmod 0755 /mnt/cloud-config/skripts/paperless-scan-mover.sh
 chmod 0644 /mnt/cloud-config/skripts/paperless-scan-mover.conf
 chmod 0644 /mnt/cloud-config/skripts/paperless-scan-mover.service
@@ -330,7 +330,7 @@ Vor
 Folgendes hinzufügen
 ```
 [Max-Paperless]
-path = /opt/ncdata/data/scan-staging/user1/
+path = /Raid6-1/wichtig/cloud/scan-staging/user1/
 browsable = yes
 read only = no
 guest ok = no
