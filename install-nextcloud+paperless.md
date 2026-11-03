@@ -100,7 +100,7 @@ do
         (
             sleep 2
             echo "$(date '+%H:%M:%S') - Änderung in $NC_USER erkannt. Scanne $NC_SCAN_PATH"
-            sudo -u www-data php8.3 /var/www/nextcloud/occ files:scan --path="$NC_SCAN_PATH" --quiet
+            runuser -u www-data -- php /var/www/nextcloud/occ files:scan --path="$NC_SCAN_PATH" --quiet
             rm "$USER_LOCK"
         ) &
     fi
