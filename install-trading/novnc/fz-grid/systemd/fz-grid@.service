@@ -2,6 +2,7 @@
 Description=FZ-Grid Playwright Runner für Instanz %i
 After=fz-xvfb@%i.service
 Requires=fz-xvfb@%i.service
+StartLimitIntervalSec=0
 
 [Service]
 MemoryHigh=1800M
@@ -10,7 +11,7 @@ WorkingDirectory=/opt/fz-grid
 ExecStart=/usr/bin/node /opt/fz-grid/runner.js
 ExecStopPost=/opt/scripts/session-end.sh %i
 Restart=on-failure
-RestartSec=5
+RestartSec=30
 TimeoutStopSec=10
 KillSignal=SIGTERM
 
