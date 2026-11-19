@@ -8,6 +8,11 @@ LOGFILE="/var/log/update-and-shutdown.log"
 # die Variable nicht gesetzt -> altes, konservatives Verhalten bleibt dort.
 FZ_TRIGGER="${FZ_TRIGGER:-}"
 
+# Unter diesem freien Platz (MB) wird vor dem Update aufgeräumt.
+# Hintergrund (20.11.2026): Platte lief voll (Journal + npm-Cache + alte
+# Playwright-Builds), apt-get scheiterte und der Shutdown wurde nie erreicht.
+MIN_FREE_MB=500
+
 log() {
     echo "$(date '+%F %T') $*" | tee -a "$LOGFILE"
 }
@@ -17,7 +22,31 @@ count_running_grids() {
     | awk '$1 ~ /^fz-grid@.*\.service$/ { c++ } END { print c+0 }'
 }
 
+free_mb() {
+    df -Pm / | awk 'NR==2 { print $4 }'
+}
+
+cleanup_disk() {
+    log "Räume auf: Journal, apt-Cache, npm-Cache, alte Playwright-Builds"
+    journalctl --vacuum-size=100M >> "$LOGFILE" 2>&1 || true
+    apt-get clean >> "$LOGFILE" 2>&1 || true
+    npm cache clean --force >> "$LOGFILE" 2>&1 || true
+    # Nur den neuesten Build je Browser/Tool behalten
+    for p in firefox ffmpeg; do
+        ls -d /root/.cache/ms-playwright/${p}-* 2>/dev/null \
+            | sort -V | head -n -1 | xargs -r rm -rf
+    done
+    log "Freier Platz auf / nach Aufräumen: $(free_mb) MB"
+}
+
 log "=== Update-Lauf gestartet (Trigger: ${FZ_TRIGGER:-event}) ==="
+
+AVAIL_MB="$(free_mb)"
+log "Freier Platz auf /: ${AVAIL_MB} MB"
+if [ "$AVAIL_MB" -lt "$MIN_FREE_MB" ]; then
+    log "Warnung: weniger als ${MIN_FREE_MB} MB frei"
+    cleanup_disk
+fi
 
 RUNNING_BEFORE="$(count_running_grids)"
 log "Laufende fz-grid Instanzen vor Update: ${RUNNING_BEFORE}"
@@ -69,13 +98,17 @@ if [[ "$RUNNING_AFTER" -ne 0 && "$FZ_TRIGGER" != "timer" ]]; then
     log "Abbruch: vor dem Shutdown sind wieder ${RUNNING_AFTER} fz-grid Instanz(en) aktiv"
     exit 0
 fi
-    log "Starte Playwright/Firefox Update-Check"
-    cd /opt/fz-grid || exit 1
-    OLD_VERSION=$(npx playwright --version 2>>"$LOGFILE")
-    npm install playwright@latest >> "$LOGFILE" 2>&1
-    npx playwright install firefox >> "$LOGFILE" 2>&1
-    NEW_VERSION=$(npx playwright --version 2>>"$LOGFILE")
-    log "Playwright Version: ${OLD_VERSION} -> ${NEW_VERSION}"
+
+log "Starte Playwright/Firefox Update-Check"
+cd /opt/fz-grid || exit 1
+OLD_VERSION=$(npx playwright --version 2>>"$LOGFILE")
+npm install playwright@latest >> "$LOGFILE" 2>&1
+npx playwright install firefox >> "$LOGFILE" 2>&1
+NEW_VERSION=$(npx playwright --version 2>>"$LOGFILE")
+log "Playwright Version: ${OLD_VERSION} -> ${NEW_VERSION}"
+
+# Nach jedem Update aufräumen, damit Cache und alte Builds nicht anwachsen
+cleanup_disk
 
 log "=== Update-Lauf beendet ==="
 log "=== Fahre System jetzt herunter ==="
