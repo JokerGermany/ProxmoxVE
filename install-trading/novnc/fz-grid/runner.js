@@ -1,5 +1,17 @@
 // /opt/fz-grid/runner.js
-// Version: 2.4.0 (Firefox-Port + speicherbasiertes Browser-Recycling + Seiten-Watchdog)
+// Version: 2.4.2 (Firefox-Port + speicherbasiertes Browser-Recycling + Seiten-Watchdog)
+//
+// Neu in 2.4.2 (Störfall 20.11.2026: beide Instanzen dauerhaft an MemoryHigh):
+// - page.evaluate mit Timeout (evalWithTimeout). Unter Speicherdruck hing
+//   getRecycleBlocker() in page.evaluate; checkRunning blieb gesetzt und der
+//   Speicher-Watchdog prüfte nie wieder (user1 ab 19:55 ohne jeden Log-Eintrag).
+// - Recycle mit Zeitlimit (RECYCLE_TIMEOUT_MS). Hängt context.close() oder der
+//   Neustart, beendet sich der Runner mit Exit 1 und systemd startet neu
+//   (user2 ab 20:02 "starte Firefox neu…" ohne "abgeschlossen").
+// - Herzschlag: Bleibt eine Speicherprüfung länger als
+//   RECYCLE_CHECK_STUCK_MS hängen, ebenfalls Exit 1.
+// - Harte Grenze (RECYCLE_HARD_LIMIT_MB): darüber wird ohne Aufschub
+//   recycelt, auch bei offener Order-Maske oder Tiefensuche.
 //
 // Neu in 2.4.0 (Störfall 09.11.2026, Server-Timeout gegen 20:40):
 // - Navigation zur Zielseite mit Retry/Backoff (gotoTarget). Ein Timeout beim
@@ -38,7 +50,7 @@ const { firefox } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-const RUNNER_VERSION = '2.4.1';
+const RUNNER_VERSION = '2.4.2';
 
 const USER_DATA_DIR = process.env.USER_DATA_DIR;
 if (!USER_DATA_DIR) {
@@ -87,6 +99,14 @@ const RECYCLE_BUSY_URL_FRAGMENT = process.env.RECYCLE_BUSY_URL_FRAGMENT || '/mei
 const RECYCLE_MAX_DEFER_MS = parseInt(process.env.RECYCLE_MAX_DEFER_MS || String(5 * 60 * 1000), 10);
 // NEU (2.4.1): Aufschub, solange das Userscript "beschäftigt" meldet (Tiefensuche).
 const RECYCLE_MAX_DEFER_BUSY_MS = parseInt(process.env.RECYCLE_MAX_DEFER_BUSY_MS || String(20 * 60 * 1000), 10);
+// NEU (2.4.2): ab hier kein Aufschub mehr (unter MemoryHigh der Unit halten).
+const RECYCLE_HARD_LIMIT_MB = parseInt(process.env.RECYCLE_HARD_LIMIT_MB || '1700', 10);
+// NEU (2.4.2): max. Dauer eines Recycles, danach Exit 1 (systemd startet neu).
+const RECYCLE_TIMEOUT_MS = parseInt(process.env.RECYCLE_TIMEOUT_MS || '90000', 10);
+// NEU (2.4.2): hängt eine Speicherprüfung länger, Exit 1.
+const RECYCLE_CHECK_STUCK_MS = parseInt(process.env.RECYCLE_CHECK_STUCK_MS || String(3 * 60 * 1000), 10);
+// NEU (2.4.2): Timeout für page.evaluate in Watchdogs/Snapshots.
+const EVAL_TIMEOUT_MS = parseInt(process.env.EVAL_TIMEOUT_MS || '5000', 10);
 
 // --- Create-Locks beim Runner-Start entfernen ---
 const CLEAR_CREATE_LOCKS_ON_START = process.env.CLEAR_CREATE_LOCKS_ON_START !== '0';
@@ -134,6 +154,22 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// NEU (2.4.2): Promise mit Zeitlimit; wirft bei Überschreitung.
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label}: Timeout nach ${ms} ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// NEU (2.4.2): page.evaluate mit Zeitlimit (hing unter Speicherdruck unbegrenzt).
+function evalWithTimeout(fn, arg, ms = EVAL_TIMEOUT_MS) {
+  const p = page.evaluate(fn, arg);
+  p.catch(() => {}); // späte Ablehnung nach dem Timeout nicht unbehandelt lassen
+  return withTimeout(p, ms, 'page.evaluate');
+}
+
 function cleanupStaleLocks() {
   const lockFiles = ['lock', '.parentlock', 'SingletonLock', 'SingletonSocket', 'SingletonCookie'];
 
@@ -175,7 +211,7 @@ async function snapshotSessionCookies() {
 async function snapshotSessionStorage() {
   if (!page || page.isClosed()) return;
   try {
-    const result = await page.evaluate((origin) => {
+    const result = await evalWithTimeout((origin) => {
       // GEÄNDERT (2.4.0): nur auf der Ziel-Origin sichern. Auf einer
       // Fehlerseite würde sonst ein leerer Stand den letzten guten
       // Snapshot überschreiben.
@@ -329,7 +365,7 @@ async function checkPageHealth() {
 
   let problem = null;
   try {
-    const uri = await page.evaluate(() => document.documentURI);
+    const uri = await evalWithTimeout(() => document.documentURI);
     if (FIREFOX_ERROR_URI_RE.test(uri || '')) {
       problem = `Firefox-Fehlerseite (${String(uri).slice(0, 60)}…, URL ${page.url()})`;
     } else {
@@ -583,6 +619,13 @@ async function recycleBrowser() {
   const startedAt = Date.now();
   console.log('[RUNNER] Browser-Recycle: sichere Session-Zustand und starte Firefox neu…');
 
+  // NEU (2.4.2): hängt der Recycle (context.close/Neustart unter Speicherdruck),
+  // Runner beenden; systemd (Restart=on-failure) startet ihn neu.
+  const recycleTimer = setTimeout(() => {
+    console.error(`[RUNNER] Browser-Recycle nach ${RECYCLE_TIMEOUT_MS / 1000}s nicht abgeschlossen – beende Runner mit Fehler, systemd startet neu.`);
+    process.exit(1);
+  }, RECYCLE_TIMEOUT_MS);
+
   try {
     if (snapshotIntervalHandle) { clearInterval(snapshotIntervalHandle); snapshotIntervalHandle = null; }
     stopLoginIdleWatch();
@@ -613,6 +656,7 @@ async function recycleBrowser() {
     console.error('[RUNNER] Browser-Recycle fehlgeschlagen (Firefox-Start) – beende Runner mit Fehler, systemd startet neu:', err);
     process.exit(1);
   } finally {
+    clearTimeout(recycleTimer);
     recycling = false;
   }
 }
@@ -625,7 +669,7 @@ async function getRecycleBlocker() {
     if (u.includes(RECYCLE_BUSY_URL_FRAGMENT)) {
       return { reason: `Order-Vorgang aktiv (URL enthält "${RECYCLE_BUSY_URL_FRAGMENT}")`, maxMs: RECYCLE_MAX_DEFER_MS };
     }
-    const busy = await page.evaluate(() => document.documentElement?.dataset?.fzGridBusy || '');
+    const busy = await evalWithTimeout(() => document.documentElement?.dataset?.fzGridBusy || '');
     if (busy) {
       return { reason: `Userscript beschäftigt (${busy})`, maxMs: RECYCLE_MAX_DEFER_BUSY_MS };
     }
@@ -646,9 +690,18 @@ function startRecycleWatch() {
               `Order-Schutz bei URL-Fragment "${RECYCLE_BUSY_URL_FRAGMENT}", max. Aufschub ${RECYCLE_MAX_DEFER_MS / 60000} Min).`);
 
   let checkRunning = false;
+  let checkStartedAt = 0;
   recycleCheckHandle = setInterval(async () => {
-    if (checkRunning) return;
+    if (checkRunning) {
+      // NEU (2.4.2): Herzschlag – eine hängende Prüfung legte den Watchdog bisher dauerhaft lahm.
+      if (!recycling && Date.now() - checkStartedAt > RECYCLE_CHECK_STUCK_MS) {
+        console.error(`[RUNNER] Speicher-Watchdog hängt seit ${Math.round((Date.now() - checkStartedAt) / 1000)}s – beende Runner mit Fehler, systemd startet neu.`);
+        process.exit(1);
+      }
+      return;
+    }
     checkRunning = true;
+    checkStartedAt = Date.now();
     try {
       await recycleCheckOnce();
     } catch (err) {
@@ -676,7 +729,11 @@ async function recycleCheckOnce() {
       return;
     }
 
-    const blocker = await getRecycleBlocker();
+    // NEU (2.4.2): über der harten Grenze kein Aufschub mehr.
+    const blocker = mb >= RECYCLE_HARD_LIMIT_MB ? null : await getRecycleBlocker();
+    if (mb >= RECYCLE_HARD_LIMIT_MB) {
+      console.warn(`[RUNNER] Speicher ${mb} MB >= harte Grenze ${RECYCLE_HARD_LIMIT_MB} MB – Recycle ohne Aufschub.`);
+    }
     if (blocker) {
       if (recycleDeferSinceTs === 0) recycleDeferSinceTs = Date.now();
       const deferredMs = Date.now() - recycleDeferSinceTs;
