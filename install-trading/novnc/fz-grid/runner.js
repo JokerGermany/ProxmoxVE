@@ -1,6 +1,18 @@
 // /opt/fz-grid/runner.js
 // Version: 2.4.2 (Firefox-Port + speicherbasiertes Browser-Recycling + Seiten-Watchdog)
 //
+// Neu in 2.4.4 (Störfall 27.11.2026 12:33: Order-Maske hing beim Laden,
+//   Seiten-Watchdog versuchte page.goto, das selbst 4,5 Min hing; während
+//   der Wiederherstellung war auch der Speicher-Watchdog blockiert):
+// - Ist die Seite per page.evaluate nicht mehr auswertbar (Content-Prozess
+//   hängt), wird Firefox neu gestartet (Recycle) statt page.goto. Bei einer
+//   Firefox-Fehlerseite bleibt es bei page.goto.
+//
+// Neu in 2.4.3 (Speicherwachstum ~1,5 GB in 6-7 Min):
+// - Firefox-Einstellungen gegen Speicherwachstum je Navigation: kein
+//   Back-Forward-Cache, kurze Session-History, RAM-Cache begrenzt,
+//   Sitzungsspeicherung seltener. Abschaltbar mit FF_MEMORY_PREFS=0.
+//
 // Neu in 2.4.2 (Störfall 20.11.2026: beide Instanzen dauerhaft an MemoryHigh):
 // - page.evaluate mit Timeout (evalWithTimeout). Unter Speicherdruck hing
 //   getRecycleBlocker() in page.evaluate; checkRunning blieb gesetzt und der
@@ -50,7 +62,7 @@ const { firefox } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-const RUNNER_VERSION = '2.4.2';
+const RUNNER_VERSION = '2.4.4';
 
 const USER_DATA_DIR = process.env.USER_DATA_DIR;
 if (!USER_DATA_DIR) {
@@ -106,6 +118,8 @@ const RECYCLE_TIMEOUT_MS = parseInt(process.env.RECYCLE_TIMEOUT_MS || '90000', 1
 // NEU (2.4.2): hängt eine Speicherprüfung länger, Exit 1.
 const RECYCLE_CHECK_STUCK_MS = parseInt(process.env.RECYCLE_CHECK_STUCK_MS || String(3 * 60 * 1000), 10);
 // NEU (2.4.2): Timeout für page.evaluate in Watchdogs/Snapshots.
+// NEU (2.4.3): Firefox-Speicher-Prefs (0 = aus).
+const FF_MEMORY_PREFS = process.env.FF_MEMORY_PREFS !== '0';
 const EVAL_TIMEOUT_MS = parseInt(process.env.EVAL_TIMEOUT_MS || '5000', 10);
 
 // --- Create-Locks beim Runner-Start entfernen ---
@@ -364,6 +378,7 @@ async function checkPageHealth() {
   if (!startupCompleted || !page || page.isClosed()) return;
 
   let problem = null;
+  let hung = false;
   try {
     const uri = await evalWithTimeout(() => document.documentURI);
     if (FIREFOX_ERROR_URI_RE.test(uri || '')) {
@@ -374,6 +389,7 @@ async function checkPageHealth() {
   } catch (err) {
     healthEvalFailures++;
     if (healthEvalFailures >= HEALTH_MAX_EVAL_FAILURES) {
+      hung = true;
       problem = `Seite ${healthEvalFailures}x nicht auswertbar (${String(err && err.message || err).split('\n')[0]}, URL ${page.url()})`;
     }
   }
@@ -381,9 +397,19 @@ async function checkPageHealth() {
 
   if (Date.now() - lastHealthRecoverTs < HEALTH_RECOVER_MIN_INTERVAL_MS) return;
 
-  healthRecovering = true;
   lastHealthRecoverTs = Date.now();
   healthEvalFailures = 0;
+
+  // NEU (2.4.4): hängender Content-Prozess -> page.goto hilft nicht (hing
+  // selbst minutenlang), Firefox komplett neu starten. Recycle hat ein
+  // eigenes Zeitlimit (RECYCLE_TIMEOUT_MS).
+  if (hung) {
+    console.warn(`[RUNNER] Seiten-Watchdog: ${problem} – Seite hängt, starte Firefox neu (Recycle).`);
+    await recycleBrowser();
+    return;
+  }
+
+  healthRecovering = true;
   try {
     console.warn(`[RUNNER] Seiten-Watchdog: ${problem} – navigiere auf ${TARGET_URL}.`);
     await gotoTarget('Seiten-Watchdog');
@@ -485,6 +511,7 @@ async function startBrowserSession() {
   console.log(`[RUNNER] Starte Firefox (Playwright-Build) mit Profil: ${USER_DATA_DIR}`);
   console.log(`[RUNNER] DISPLAY: ${process.env.DISPLAY || '(nicht gesetzt)'}`);
   console.log(`[RUNNER] Fenstergröße (Ziel via --width/--height): ${WINDOW_SIZE.width}x${WINDOW_SIZE.height}`);
+  console.log(`[RUNNER] Speicher-Prefs für Firefox: ${FF_MEMORY_PREFS ? 'an' : 'aus'}`);
   console.log(`[RUNNER] Login-Idle-Timeout: ${LOGIN_IDLE_TIMEOUT_MS / 60000} Minuten (Origin ohne Subpath: ${TARGET_ORIGIN}/)`);
 
   // Ein Fehler HIER (Firefox startet nicht) bleibt fatal – der Aufrufer beendet.
@@ -493,7 +520,21 @@ async function startBrowserSession() {
     viewport: null,
     firefoxUserPrefs: {
       'signon.rememberSignons': true,
-      'ui.popup.disable_autohide': true
+      'ui.popup.disable_autohide': true,
+      ...(FF_MEMORY_PREFS ? {
+        // keine alten Seiten im Back-Forward-Cache halten
+        'browser.sessionhistory.max_total_viewers': 0,
+        'browser.sessionhistory.max_entries': 5,
+        // RAM-Cache für Netzwerkinhalte begrenzen (KB)
+        'browser.cache.memory.capacity': 16384,
+        // Sitzungswiederherstellung: seltener serialisieren, keine geschlossenen Tabs/Fenster merken
+        'browser.sessionstore.interval': 300000,
+        'browser.sessionstore.max_tabs_undo': 0,
+        'browser.sessionstore.max_windows_undo': 0,
+        // Neuer-Tab-Seite ohne Inhalte
+        'browser.newtabpage.enabled': false,
+        'browser.newtabpage.activity-stream.feeds.topsites': false
+      } : {})
     }
   });
 
